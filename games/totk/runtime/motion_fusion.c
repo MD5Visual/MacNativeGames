@@ -24,7 +24,7 @@ static double R[3][3];          /* controller -> reference; row i = reference ax
 static double angle[3];
 static int restart = 1, live;
 static int from[3] = {0, 1, 2};
-static double sign[3] = {1, 1, 1}, det = 1;
+static double sign[3] = {1, 1, 1}, det = 1, deadzone, gain[3] = {1.2, 1.0, 0.75};   /* defaults playtested on Pro Controller; TOTK_GYRO_GAIN overrides */
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -55,21 +55,18 @@ static void orthonormalize(void) {   /* rows, from the up row (the one the gravi
     n = norm3(R[0]); for (int j = 0; j < 3; j++) R[0][j] /= n;
     cross3(R[2], R[0], R[1]);
 }
-/* A fresh orientation: z up against the measured gravity, x as close to the controller's x as that allows. */
+/* A fresh orientation: the controller's current pose IS the reference (2026-10-19: like the real hid service, the direction
+   matrix starts at identity when the game starts the sensor; a gravity-locked reference instead adds a world rotation into
+   every relative pose the game reads, which flips its yaw while leaving pitch looking right. The game re-centers by itself. */
 static void align_to(const double acc[3]) {
-    double n = norm3(acc), up[3] = {0, 0, 1}, x[3] = {1, 0, 0};
-    if (n > 0.5) for (int j = 0; j < 3; j++) up[j] = -acc[j] / n;
-    if (fabs(up[0]) > 0.9) { x[0] = 0; x[1] = 1; }
-    memcpy(R[2], up, sizeof up); memcpy(R[0], x, sizeof x); orthonormalize();
+    (void)acc;
+    R[0][0] = 1; R[0][1] = 0; R[0][2] = 0;
+    R[1][0] = 0; R[1][1] = 1; R[1][2] = 0;
+    R[2][0] = 0; R[2][1] = 0; R[2][2] = 1;
 }
 static void integrate(const double gyro[3], const double acc[3], double dt) {
-    double w[3] = {gyro[0], gyro[1], gyro[2]}, n = norm3(acc);
-    if (fabs(n - 1) < 0.15) {   /* not being accelerated: turn the estimated down toward the measured one */
-        const double kp = 0.5;
-        double measured[3] = {acc[0] / n, acc[1] / n, acc[2] / n}, estimated[3] = {-R[2][0], -R[2][1], -R[2][2]}, e[3];
-        cross3(measured, estimated, e);
-        for (int j = 0; j < 3; j++) w[j] += kp * e[j];
-    }
+    (void)acc;   /* no gravity correction: like the real hid service the pose is pure gyro integration from the last re-center */
+    double w[3] = {gyro[0], gyro[1], gyro[2]};
     double rate = norm3(w), theta = rate * dt;
     if (theta < 1e-12) return;
     double k[3] = {w[0] / rate, w[1] / rate, w[2] / rate}, s = sin(theta), c = 1 - cos(theta);
@@ -85,10 +82,14 @@ static void integrate(const double gyro[3], const double acc[3], double dt) {
     }
     memcpy(R, out, sizeof R); orthonormalize();
 }
+void runtime_motion_deadzone(double rad_s) { pthread_mutex_lock(&lock); deadzone = rad_s; pthread_mutex_unlock(&lock); }
+void runtime_motion_gain(const double g[3]) { pthread_mutex_lock(&lock); memcpy(gain, g, sizeof gain); pthread_mutex_unlock(&lock); }
 void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint64_t now) {
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
     for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
+    if (deadzone) for (int i = 0; i < 3; i++) if (fabs(gyro[i]) < deadzone) gyro[i] = 0;
+    for (int i = 0; i < 3; i++) gyro[i] *= gain[i];
     double dt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   /* a gap (sensors were off, the app was in the background): no integration across it */
     last_ns = now; live = 1;

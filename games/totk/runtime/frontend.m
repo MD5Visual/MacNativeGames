@@ -104,6 +104,27 @@ static CVReturn vsync_callback(CVDisplayLinkRef link,const CVTimeStamp *now,cons
 -(void)position{if(!self.superview)return;CGFloat w=MIN(560,MAX(280,self.superview.bounds.size.width-40)),h=140;NSRect f=NSMakeRect(floor((self.superview.bounds.size.width-w)/2),floor((self.superview.bounds.size.height-h)/2),w,h);if(!NSEqualRects(self.frame,f))self.frame=f;self.label.frame=NSInsetRect(self.bounds,20,18);}
 @end
 void runtime_shortcut_help_toggle(void){int show=fps_overlay_toggle_hints();dispatch_async(dispatch_get_main_queue(), ^{shortcutHelp.hidden=!show;});}
+/* Small transient notice over the game picture, same style as the shortcut help; used for gyro re-centering. */
+static NSView *toastView;static int toastGen;
+void runtime_toast(const char *text){
+ if(!text||!fps_overlay_hints_enabled())return;   /* toasts follow the key-1 overlay switch */
+ dispatch_async(dispatch_get_main_queue(), ^{
+  if(!window.contentView)return;
+  if(!toastView){
+   toastView=[[TOTKShortcutHelp alloc] initWithFrame:NSZeroRect];
+   toastView.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
+   [window.contentView addSubview:toastView positioned:NSWindowAbove relativeTo:bootOverlay];
+  }
+  TOTKShortcutHelp *t=(TOTKShortcutHelp *)toastView;
+  t.label.stringValue=@(text);
+  CGFloat w=MIN(560,MAX(280,window.contentView.bounds.size.width-40)),h=64;
+  toastView.frame=NSMakeRect(floor((window.contentView.bounds.size.width-w)/2),40,w,h);
+  t.label.frame=NSInsetRect(toastView.bounds,20,10);
+  toastView.hidden=NO;
+  int gen=++toastGen;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{if(gen==toastGen)toastView.hidden=YES;});
+ });
+}
 /* The drawable follows the window's pixel size; the present pass scales the game picture (1920x1080 docked) into it and
    keeps 16:9 (black bars on other shapes), so a larger window or full screen shows the game at its own resolution instead
    of a fixed small drawable that the compositor stretches. */

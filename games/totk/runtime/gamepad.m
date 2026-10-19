@@ -33,6 +33,7 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad) {
     if (pad.buttonY.isPressed) buttons |= 1ULL << 3;
     if (pad.leftThumbstickButton.isPressed) buttons |= 1ULL << 4;
     if (pad.rightThumbstickButton.isPressed) buttons |= 1ULL << 5;
+    if ((buttons & (3ULL << 4)) == (3ULL << 4)) buttons &= ~(3ULL << 4);   /* both sticks together = gyro recenter combo, not crouch+scope */
     if (pad.leftShoulder.isPressed) buttons |= 1ULL << 6;
     if (pad.rightShoulder.isPressed) buttons |= 1ULL << 7;
     if (pad.leftTrigger.isPressed) buttons |= 1ULL << 8;

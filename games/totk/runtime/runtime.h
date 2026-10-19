@@ -97,7 +97,9 @@ void runtime_game_slot_acquire(const char *mode);   /* runtime/game_slot.c: one 
 void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_shortcut_help_toggle(void);
+void runtime_toast(const char *text);
 int fps_overlay_toggle_hints(void);   /* shared key 1 toggle for FPS, shader and system-load overlays */
+int fps_overlay_hints_enabled(void);
 
 void *runtime_account_override(const char *name);
 
@@ -131,7 +133,10 @@ int runtime_motion_read(RuntimeMotionState *out, int max);   /* newest first; 0 
 void runtime_motion_start(void);   /* the game (re)started its sensor: angle and direction start over */
 void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* runtime/motion_fusion.c */
 int runtime_motion_axes(const char *spec);   /* TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed */
+void runtime_motion_deadzone(double rad_s);   /* TOTK_GYRO_DEADZONE: rotation components below this read as still; 0 off */
+void runtime_motion_gain(const double g[3]);  /* TOTK_GYRO_GAIN="x,y,z": per-axis rotation sensitivity multipliers; 1 is the hardware rate */
 void runtime_motion_live(int on);   /* a controller with motion attached (1) / detached (0) */
+int runtime_procon_motion_start(void);   /* runtime/procon_motion.c: the Pro Controller's own gyro reports; 1 = streaming */
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;

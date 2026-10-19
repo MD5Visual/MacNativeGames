@@ -189,7 +189,32 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
             const char *axes = getenv("TOTK_GYRO_AXES"); int r = runtime_motion_axes(axes);
             if (r < 0) runtime_fail("TOTK_GYRO_AXES must name x, y and z once each, e.g. \"-x,y,-z\"");
             if (r > 0) fprintf(stderr, "[gyro] axes remapped by TOTK_GYRO_AXES=%s\n", axes);
+            const char *dz = getenv("TOTK_GYRO_DEADZONE");
+            if (dz) {
+                char *end; double v = strtod(dz, &end);
+                if (end == dz || *end || v < 0 || v > 1) runtime_fail("TOTK_GYRO_DEADZONE must be a number of rad/s in [0, 1]");
+                runtime_motion_deadzone(v);
+                fprintf(stderr, "[gyro] rotation below %g rad/s reads as still (TOTK_GYRO_DEADZONE)\n", v);
+            }
+            const char *gn = getenv("TOTK_GYRO_GAIN");
+            if (gn) {
+                double g[3] = {1, 1, 1};
+                char *p = (char *)gn;
+                for (int i = 0; i < 3; i++) {
+                    char *end; g[i] = strtod(p, &end);
+                    if (end == p || g[i] < 0.1 || g[i] > 3) runtime_fail("TOTK_GYRO_GAIN must be three numbers in [0.1, 3], e.g. \"1,1,0.85\"");
+                    if (i < 2) { if (*end != ',') runtime_fail("TOTK_GYRO_GAIN must be three numbers in [0.1, 3], e.g. \"1,1,0.85\""); p = end + 1; }
+                    else if (*end) runtime_fail("TOTK_GYRO_GAIN must be three numbers in [0.1, 3], e.g. \"1,1,0.85\"");
+                }
+                runtime_motion_gain(g);
+                fprintf(stderr, "[gyro] rotation sensitivity %g, %g, %g (TOTK_GYRO_GAIN)\n", g[0], g[1], g[2]);
+            }
         });
+        if (strstr(name, "Pro Controller") && runtime_procon_motion_start()) {   /* its GCMotion sensors report nothing */
+            motionPad = c; runtime_motion_live(1);
+            fprintf(stderr, "[gyro] %s: motion from its own HID reports (200 Hz, gyro and acceleration)\n", name);
+            return;
+        }
         GCMotion *m = c.motion;
         if (!m || !m.hasRotationRate) { fprintf(stderr, "[gyro] %s has no gyro: no motion from it\n", name); return; }
         if (m.sensorsRequireManualActivation) m.sensorsActive = YES;
