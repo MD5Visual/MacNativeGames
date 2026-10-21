@@ -27,7 +27,12 @@
    turned nothing and its motion aim came out much smaller than in TOTK (right at 30 FPS). So the states are produced
    every 5 ms of real time, with the latest sample's rate held in between, up to the moment the game reads them (and up
    to each new sample, before it takes over); at most 50 ms past the last sample, and no integration across a longer gap.
-   TOTK_GYRO_CLOCK=0: produced only as samples arrive (still in 5 ms steps). */
+   TOTK_GYRO_CLOCK=0: produced only as samples arrive (still in 5 ms steps).
+
+   Zero-rate bias (2026-10-20, from the Pro Controller HID reader of feat/totk-pro-con-gyro): a dead zone cannot remove a
+   bias above it, and a real Pro Controller's bias drifts past 1.2 deg/s in normal use (the aim pulls one way). While the
+   controller is still (gravity within 4 % of 1 G, rotation under 0.3 rad/s), pull the bias toward the reading with a 2 s
+   time constant, as the Switch's own drift correction does; the estimate survives recentering, it is a sensor property. */
 #include "runtime.h"
 #include <math.h>
 #include <pthread.h>
@@ -47,6 +52,7 @@ static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
 static int mouse_owns, controller_live, phone_live;
+static double gyro_bias[3];   /* rad/s, learned while the controller is still */
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -141,7 +147,19 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         deadzone = v * M_PI / 180;
         if (e) fprintf(stderr, "[gyro] dead zone %.2f deg/s (TOTK_GYRO_DEADZONE)\n", v);
     }
-    double rate = norm3(gyro), keep = rate > deadzone ? (rate - deadzone) / rate : 0;
+    double rate = norm3(gyro);
+    /* Zero-rate bias, as the Switch's own drift correction: while the controller is still (gravity within 4 % of 1 G,
+       rotation under 0.3 rad/s) pull the bias toward the reading with a 2 s time constant. A dead zone cannot remove a
+       bias above it, and a real Pro Controller's drifts past 1.2 deg/s in normal use — the aim then pulls one way.
+       dt here mirrors feed_locked's (last_ns is still the previous sample's); the mouse path has no sensor bias. */
+    double bdt = last_ns && now > last_ns ? (now - last_ns) / 1e9 : 0.004;
+    if (bdt > 0.05) bdt = 0.004;
+    double an = norm3(acc);
+    if (fabs(an - 1) < 0.04 && rate < 0.3)
+        for (int i = 0; i < 3; i++) gyro_bias[i] += (gyro[i] - gyro_bias[i]) * bdt / 2.0;
+    for (int i = 0; i < 3; i++) gyro[i] -= gyro_bias[i];
+    rate = norm3(gyro);
+    double keep = rate > deadzone ? (rate - deadzone) / rate : 0;
     for (int i = 0; i < 3; i++) gyro[i] *= keep;
     if (mouse_owns) { pthread_mutex_unlock(&lock); return; }
     feed_locked(acc, gyro, now);
