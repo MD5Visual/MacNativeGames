@@ -96,15 +96,39 @@ class AddressWait(unittest.TestCase):
                 got=self.call(program,0x35,3,word,word,0);self.assertEqual(got['result'],0);self.assertEqual(got['value'],(word+1)&((1<<64)-1))
                 got=self.call(program,0x35,3,word,word^(1<<32),0);self.assertEqual(got['result'],R_BAD_STATE);self.assertEqual(got['value'],word)
 
-    @unittest.expectedFailure  # 2e7e6036 reads the word without validating the required 8-byte alignment.
     def test_unaligned_64_bit_wait_returns_an_error_without_host_crash(self):
-        got=self.call(self.programs[1],0x34,3,7,7,0,4)
-        self.assertEqual(got['result'],R_BAD_ADDRESS);self.assertEqual(got['value'],7)
+        for program in self.programs:
+            for offset in (1,2,4):
+                with self.subTest(variant=program.name,offset=offset):
+                    got=self.call(program,0x34,3,7,7,0,offset)
+                    self.assertEqual(got['result'],R_BAD_ADDRESS);self.assertEqual(got['value'],7)
 
-    @unittest.expectedFailure  # 2e7e6036 treats an unrecognised signal type as the 32-bit increment operation.
     def test_unknown_signal_type_rejects_without_modifying_memory(self):
-        got=self.call(self.programs[1],0x35,4,0x1234567800000007,7,0)
-        self.assertEqual(got['result'],R_BAD_ENUM);self.assertEqual(got['value'],0x1234567800000007)
+        for program in self.programs:
+            for kind in (4,0xffffffff):
+                with self.subTest(variant=program.name,kind=kind):
+                    got=self.call(program,0x35,kind,0x1234567800000007,7,0)
+                    self.assertEqual(got['result'],R_BAD_ENUM);self.assertEqual(got['value'],0x1234567800000007)
+
+    def test_unknown_wait_type_rejects_without_reading_or_decrementing(self):
+        for program in self.programs:
+            for kind in (4,0xffffffff):
+                got=self.call(program,0x34,kind,7,8,0)
+                self.assertEqual(got['result'],R_BAD_ENUM);self.assertEqual(got['value'],7)
+
+    def test_signal_and_legacy_wait_alignment(self):
+        for program in self.programs:
+            for svc in (0x34,0x35):
+                for kind in range(4):
+                    for offset in ((1,2,4) if kind==3 else (1,2)):
+                        with self.subTest(variant=program.name,svc=svc,kind=kind,offset=offset):
+                            got=self.call(program,svc,kind,7,7,0,offset)
+                            self.assertEqual(got['result'],R_BAD_ADDRESS);self.assertEqual(got['value'],7)
+
+    def test_validation_precedes_memory_access(self):
+        for program in self.programs:
+            got=self.probe(program,'guard-validation')
+            self.assertEqual(got['errors'],[R_BAD_ENUM,R_BAD_ENUM,R_BAD_ADDRESS,R_BAD_ADDRESS])
 
     def test_regression_checks_detect_truncated_value_and_load(self):
         original=(ROOT/'games/totk/runtime/threads.c').read_text();needle='ld64(addr) == regs[2]';self.assertEqual(original.count(needle),1)

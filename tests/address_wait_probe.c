@@ -40,7 +40,12 @@ static int was_woken(waiter *w) { pthread_mutex_lock(&G);int woke=w->record.woke
 int main(int argc,char **argv) {
     signal(SIGBUS,probe_fault);signal(SIGSEGV,probe_fault);
     assert(argc>=2);g_cores_on=0;assert(!pthread_key_create(&g_keythr,NULL));thr_t main_thread;thread_record(&main_thread,44);
-    if(!strcmp(argv[1],"call")){
+    if(!strcmp(argv[1],"guard-validation")){
+        size_t size=(size_t)sysconf(_SC_PAGESIZE);uint8_t *p=mmap(NULL,size,PROT_NONE,MAP_PRIVATE|MAP_ANON,-1,0);assert(p!=MAP_FAILED);
+        uint64_t a=invoke(0x34,p,4,7,0),b=invoke(0x35,p,4,7,0),c=invoke(0x34,p+4,3,7,0),d=invoke(0x35,p+4,3,7,0);
+        assert(!munmap(p,size));assert(!g_wait);
+        printf("{\"errors\":[%llu,%llu,%llu,%llu]}\n",(unsigned long long)a,(unsigned long long)b,(unsigned long long)c,(unsigned long long)d);
+    }else if(!strcmp(argv[1],"call")){
         assert(argc==8);int svc=(int)strtol(argv[2],NULL,0);unsigned type=(unsigned)strtoul(argv[3],NULL,0);
         uint64_t initial=strtoull(argv[4],NULL,0),value=strtoull(argv[5],NULL,0);int64_t limit=strtoll(argv[6],NULL,0);unsigned offset=(unsigned)strtoul(argv[7],NULL,0);assert(offset<=8);
         _Alignas(16) unsigned char memory[32];memset(memory,0xa5,sizeof memory);memcpy(memory+offset,&initial,8);

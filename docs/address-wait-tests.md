@@ -12,9 +12,9 @@ low-word-only updates. Four-byte alignment is accepted for the 32-bit modes. Del
 or load only 32 bits; the regression checks detect both errors. Calls also check that the saved guest register slots
 X1..X31 are preserved; the fixture invokes the C dispatcher, not a rewritten SVC gate.
 
-## Known validation gaps at 2e7e6036
+## Validation regressions from 2e7e6036
 
-Two tests are explicit `expectedFailure` cases, not passes:
+The original tests recorded two explicit `expectedFailure` cases on the bring-up branch:
 
 - A 64-bit wait on a four-byte-aligned but not eight-byte-aligned address should return InvalidAddress (kernel module
   1, description 102, `0xcc01`). The implementation reads it without that validation. On the tested M3 Pro it returns
@@ -22,8 +22,10 @@ Two tests are explicit `expectedFailure` cases, not passes:
 - An unrecognised signal type (4) should return InvalidEnumValue (description 120, `0xf001`) and preserve the word.
   The implementation instead enters its 32-bit increment path, can return success and change the word.
 
-Remove each marker when the corresponding production validation is fixed; an unexpected success deliberately fails
-the suite. The tests do not change production code or claim that either gap causes OoT's render-pass gate.
+Both are fixed by checking alignment and the operation type before accessing the word or the wait queue, and both
+markers have been removed. Additional cases cover legacy 32-bit alignment, invalid wait types, both signal widths,
+and PROT_NONE memory: invalid parameters must return before any load or store. The fork's existing signal type 3 is
+preserved pending clarification of its API contract. These fixes do not establish a cause for OoT's render-pass gate.
 
 ## API scope
 

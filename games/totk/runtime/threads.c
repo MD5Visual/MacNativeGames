@@ -39,6 +39,8 @@
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
 #define R_OUT_OF_RES  0xCE01u   // 103
+#define R_BAD_ADDRESS 0xCC01u   // 102 InvalidAddress
+#define R_BAD_ENUM    0xF001u   // 120 InvalidEnumValue
 #ifdef GAME_BOTW
 #define R_BAD_CORE    0xE201u   // 113 InvalidCoreId
 #define R_BAD_COMBO   0xE801u   // 116 InvalidCombination
@@ -1142,7 +1144,11 @@ int svc_thread(int num, uint64_t *regs) {
     }
 
     case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等、3 64 位相等则等（Switch 2 SDK） | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less then wait, 2 wait if equal, 3 wait if equal (64-bit, Switch 2 SDK; Lichii #87 found Ocarina needs it)
-        thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
+        thr_t *t = cur(); uint64_t addr = regs[0]; uint32_t type = (uint32_t)regs[1]; int32_t val = (int32_t)regs[2];
+        /* Validate before touching the word or registering a waiter. Only type 3 accesses eight bytes; the older
+           modes still accept four-byte alignment and use the low 32 bits of the value operand. */
+        if (addr & (type == 3 ? 7u : 3u)) { regs[0] = R_BAD_ADDRESS; return 1; }
+        if (type > 3) { regs[0] = R_BAD_ENUM; return 1; }
         {   /* TEMP probe (OoT): if main's armed barrier wait is still pending 10 s later, this svc call (any thread)
                means the game is parked forever - dump the pipeline state at the park. */
             runtime_park_check(); }
@@ -1245,7 +1251,11 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; return 1;
     }
     case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒、3 64 位相等则加一并唤醒（Switch 2 SDK） | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake, 3 increment if equal (64-bit, Switch 2 SDK)
-        uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
+        uint64_t addr = regs[0]; uint32_t type = (uint32_t)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
+        /* Keep this fork's type-3 compare/increment extension, but reject other unknown types rather than falling
+           through to a 32-bit write. The extension's 64-bit CAS needs eight-byte alignment. */
+        if (addr & (type == 3 ? 7u : 3u)) { regs[0] = R_BAD_ADDRESS; return 1; }
+        if (type > 3) { regs[0] = R_BAD_ENUM; return 1; }
         pthread_mutex_lock(&G);
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
