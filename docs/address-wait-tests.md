@@ -45,3 +45,24 @@ The fork's signal type 3 (64-bit compare/increment) is separately labelled a cha
 low-word carry, wraparound and high-word mismatch. It is not a claim that Switch hardware implements that operation.
 The documented 64-bit-wait / type-0-signal path is tested independently. A game trace or an SDK reference is still
 needed to establish the intended contract of signal type 3.
+
+## Change and validation record
+
+The branch starts at MD5Visual's OoT bring-up commit `2e7e6036`:
+
+- `327b000f` adds the address-arbitration fixture and tests. At that base, ten methods run with two explicit expected
+  validation failures. The full suite reports 1454 tests, 164 skipped and those two expected failures.
+- `51de53df` validates alignment and enum before memory/queue access, expands the negative cases, and removes the two
+  expected-failure markers. Thirteen focused methods and the full suite (1457 tests, 164 skipped) pass.
+- `b25a274f` restores the standalone thread-lifecycle probe's loader bookkeeping. Its synthetic host code has no mapped
+  game PC and no HLE-stack slot; returning no guest module from the fixture is intentional. Real Darwin keys are
+  allocated so the fixture does not accidentally use reserved key zero. The Makefile creates build/analysis directories
+  even when no game build has run first. The production thread runtime is unchanged by this commit.
+
+Checked on a MacBook Pro M3 Pro with macOS 27.0 and Xcode 27.2. The repaired lifecycle probe passes 32 thread/event
+lifecycles in both base and `GAME_OOT`/`GAME_NS2` builds. A separate clean temporary checkout without build/analysis
+directories passes `make probe-thread`. The thirteen address-wait methods still pass. These synthetic checks do not
+establish game rendering or movie playback correctness.
+
+After the lifecycle-probe repair, the full suite was rerun: 1457 tests, 169 skipped, no failures/errors. This run's
+skip count differs from the earlier address-fix run above; the counts are reported separately rather than combined.
