@@ -5,6 +5,11 @@ and `GAME_OOT` / `GAME_NS2`. Both include the actual `runtime/threads.c` dispatc
 priority/FIFO selection and pthread wait/wake implementation. The fixture supplies synthetic words and host-thread
 records and disables virtual-core scheduling. It does not load game data, run guest code, use the GPU or touch a profile.
 
+`make -C games/totk probe-thread` separately checks 32 native thread/event lifecycles, host stack switching, thread-exit
+waits, priorities and invalid handles. Its fixture supplies the loader bookkeeping required by threads.c, allocates
+real Darwin keys, and identifies no PC as loaded guest code. HLE-stack slots and game modules are absent. The target
+creates its output directories on a clean checkout; no game data or graphics tools are needed.
+
 Coverage includes full-width X2 comparisons (including high-bit-only mismatches, bit 63 and all ones), zero and finite
 timeouts, waking by the documented type-0 signal, address isolation, positive/zero/negative wake counts, priority and
 FIFO selection, mixed-width waiters, changing a word without signalling, 32-bit signed comparisons/decrements and

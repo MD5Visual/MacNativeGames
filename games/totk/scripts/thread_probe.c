@@ -6,6 +6,12 @@
 #include <sys/mman.h>
 #include <mach/mach_time.h>
 static atomic_uint calls,environments;
+/* This probe executes synthetic host functions, with no loaded game modules or HLE-stack slots. Supply the loader's
+   bookkeeping without classifying any host PC as guest code. Allocate real Darwin keys below; key zero is reserved. */
+pthread_key_t runtime_keys[8];
+uint64_t runtime_hle_tsd_off;
+int runtime_guest_code_pc(uint64_t pc){(void)pc;return 0;}
+uint8_t *runtime_module_base(const char *name){(void)name;return NULL;}
 _Noreturn void runtime_fail(const char *message){fprintf(stderr,"FAIL %s\n",message);exit(1);}
 void *runtime_symbol(const char *name){(void)name;runtime_fail("unexpected guest symbol");}
 void runtime_thread_init(void){atomic_fetch_add(&environments,1);}
@@ -14,6 +20,7 @@ static void need(int c,const char *m){if(!c)runtime_fail(m);}
 static void kernel(unsigned id,uint64_t *r){need(svc_thread((int)id,r)==1,"service dispatch");}
 static void child(uint64_t arg){atomic_fetch_add(&calls,1);uint64_t r[31]={arg};kernel(0x11,r);need(r[0]==0,"child signal");kernel(0x0a,r);runtime_fail("ExitThread returned");}
 int main(void){
+ for(unsigned i=0;i<8;i++)need(pthread_key_create(&runtime_keys[i],NULL)==0&&runtime_keys[i]!=0,"Darwin thread key");
  uint32_t main=svc_thread_main_init();uint64_t r[31]={0};r[1]=main;kernel(0xc,r);need(r[0]==0&&r[1]==44,"initial priority");
  r[0]=main;r[1]=31;kernel(0xd,r);r[1]=main;kernel(0xc,r);need(r[0]==0&&r[1]==31,"priority roundtrip");
  r[1]=7;kernel(0xc,r);need(r[0]==0xe401,"bad handle query");r[0]=7;kernel(0x16,r);need(r[0]==0xe401,"bad handle close");

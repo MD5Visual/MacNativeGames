@@ -165,9 +165,11 @@ verify-shaders:
 	"$(PY)" scripts/verify_shader_compilation.py
 
 build/thread-probe: scripts/thread_probe.c runtime/threads.c runtime/thread_compat.h runtime/thread_enter.S
+	mkdir -p "$(dir $@)"
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Ithird_party/d2r_gfx/gfx/nvn/include scripts/thread_probe.c runtime/threads.c runtime/thread_enter.S -o "$@"
 
 probe-thread: build/thread-probe
+	mkdir -p analysis
 	build/thread-probe > analysis/thread-probe.json
 	@cat analysis/thread-probe.json
 
