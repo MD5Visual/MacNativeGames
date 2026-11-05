@@ -348,6 +348,10 @@ void runtime_thread_init(void) {
  /* Faults and emulated instructions are handled off the guest stack, which can be as small as 4 KiB. */
  e->signal_stack=malloc(SIGNAL_STACK_SIZE);need(e->signal_stack!=NULL,"signal stack allocation");
  stack_t ss={.ss_sp=e->signal_stack,.ss_size=SIGNAL_STACK_SIZE,.ss_flags=0};need(sigaltstack(&ss,NULL)==0,"install signal stack");memcpy((uint8_t *)e->tlr+0x1f8,&e->dummy,8);
+  /* Horizon's kernel writes the thread's id into its thread-local region at creation; the new SDK's
+     SdkMutexType reads it at +0x110 to spot self-deadlock, and a zero there reads as "held by me".
+     Seed it with the same id our SVC 0x25 (GetThreadId) answers. */
+  {uint64_t tid;pthread_threadid_np(NULL,&tid);*(uint32_t *)((uint8_t *)e->tlr+0x110)=(uint32_t)tid;}
  need(pthread_setspecific(environment_key,e)==0&&pthread_setspecific(runtime_keys[0],NULL)==0,"thread ownership");
  need(pthread_setspecific(runtime_keys[1],e->tls)==0&&pthread_setspecific(runtime_keys[2],e->tlr)==0&&pthread_setspecific(runtime_keys[3],(void *)runtime_gate)==0,"thread slots");
  uintptr_t tp;__asm__ volatile("mrs %0,tpidrro_el0":"=r"(tp));

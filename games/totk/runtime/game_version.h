@@ -68,6 +68,22 @@
 #define GAME_ADDR_0xe995c4 0xffffffffu
 #define GAME_ADDR_0x2aa4fa0 0xffffffffu
 #define GAME_ADDR_0x453f648 0xffffffffu
+#elif defined(GAME_OOT)
+/* The Legend of Zelda: Ocarina of Time (0400486024DEC000), standalone update v131072 (1.1.1; Switch 2, NVN2; modules main,
+   subsdk0, sdk): the third Switch 2 game (GAME_NS2) on this host, docs/ns2-port.md. As Donkey Kong Bananza's block. Its
+   NSO sections are ZBIC and its toolchain emits only DT_GNU_HASH (both handled generally in third_party/d2r/patch_nso.py). */
+#ifndef GAME_NS2
+#define GAME_NS2 1
+#endif
+#define GAME_TITLE_ID 0x0400486024dec000ULL
+#define TOTK_GAME_VERSION "v131072"
+#define GAME_NAME "Ocarina of Time"
+#define GAME_FOLDER "OcarinaOfTime"
+#define GAME_LOG "oot"
+#define TOTK_GAME_DIR "oot"
+#define GAME_ADDR_0xe995c4 0xffffffffu
+#define GAME_ADDR_0x2aa4fa0 0xffffffffu
+#define GAME_ADDR_0x453f648 0xffffffffu
 #elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
 #define TOTK_GAME_DIR "v143"

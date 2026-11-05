@@ -373,9 +373,35 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  return r;
 }
 static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+/* TEMP probe (OoT boot): what the Switch 2 VAMM trio answers for the game's heap setup. */
+static uint32_t observed_query_mem_info(void *out){uint32_t r=((uint32_t(*)(void*))runtime_symbol("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE"))(out);uint64_t *m=out;fprintf(stderr,"[totk-probe] QueryMemoryInfo out=%llx -> m0=%llx m1=%llx m2=%llx m3=%llx result=%x\n",(unsigned long long)(uintptr_t)out,(unsigned long long)m[0],(unsigned long long)m[1],(unsigned long long)m[2],(unsigned long long)m[3],r);return r;}
+static uint32_t observed_set_heap_size(uint64_t size){uint32_t r=((uint32_t(*)(uint64_t))runtime_symbol("_ZN2nn2os17SetMemoryHeapSizeEm"))(size);fprintf(stderr,"[totk-probe] SetMemoryHeapSize %llx result=%x\n",(unsigned long long)size,r);return r;}
+static uint32_t observed_alloc_block(void *out,uint64_t size){uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryBlockEPmm"))(out,size);fprintf(stderr,"[totk-probe] AllocateMemoryBlock out=%llx size=%llx -> block=%llx result=%x\n",(unsigned long long)(uintptr_t)out,(unsigned long long)size,out?*(unsigned long long *)out:0u,r);return r;}
+static void *observed_std_init(void *self,void *heap,uint64_t size,unsigned boolarg){fprintf(stderr,"[totk-probe] StandardAllocator::Initialize self=%llx heap=%llx size=%llx bool=%u\n",(unsigned long long)(uintptr_t)self,(unsigned long long)(uintptr_t)heap,(unsigned long long)size,boolarg);uint32_t r=((uint32_t(*)(void*,void*,uint64_t,unsigned))runtime_symbol("_ZN2nn3mem17StandardAllocator10InitializeEPvmb"))(self,heap,size,boolarg);unsigned char*p=self;fprintf(stderr,"[totk-probe]   -> result=%x self[0..0x40]: %02x %02x %02x | hdr %llx %llx | flags %x\n",r,p[0],p[1],p[2],((uint64_t*)self)[2],((uint64_t*)self)[3],((uint32_t*)((char*)self+0xc))[0]);if(heap)fprintf(stderr,"[totk-probe]   block[0..0x40]: %llx %llx %llx %llx | mutex@38: %02x %02x %02x %02x %02x %02x %02x %02x | hdr30 %llx\n",((uint64_t*)heap)[0],((uint64_t*)heap)[1],((uint64_t*)heap)[2],((uint64_t*)heap)[3],((unsigned char*)heap)[0x38],((unsigned char*)heap)[0x39],((unsigned char*)heap)[0x3a],((unsigned char*)heap)[0x3b],((unsigned char*)heap)[0x3c],((unsigned char*)heap)[0x3d],((unsigned char*)heap)[0x3e],((unsigned char*)heap)[0x3f],((uint64_t*)((char*)heap+0x30))[0]);return NULL;}
+/* TEMP probe (OoT boot): the assert helper calls nndiagAbort(expr,file,line) — log the arguments. */
+static void observed_abort(uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint64_t a4,uint64_t a5,uint64_t a6,uint64_t a7){
+ char a[201]="?",b[201]="?";vm_size_t got=0;
+ if(vm_read_overwrite(mach_task_self(),(vm_address_t)a0,200,(vm_address_t)a,&got)==KERN_SUCCESS)a[strcspn(a,"\n")]=0;
+ if(vm_read_overwrite(mach_task_self(),(vm_address_t)a1,200,(vm_address_t)b,&got)==KERN_SUCCESS)b[strcspn(b,"\n")]=0;
+ fprintf(stderr,"[totk-probe] nndiagAbort x0=%llx \"%s\" x1=%llx \"%s\" x2=%llx x3=%llx x4=%llx x5=%llx x6=%llx x7=%llx\n",
+  (unsigned long long)a0,a,(unsigned long long)a1,b,(unsigned long long)a2,(unsigned long long)a3,(unsigned long long)a4,(unsigned long long)a5,(unsigned long long)a6,(unsigned long long)a7);fflush(stderr);
+ ((void(*)(void))runtime_symbol("nndiagAbort"))();
+}
+static void *observed_std_alloc(void *self,uint64_t size,uint64_t align){static unsigned n;if(n<5){n++;fprintf(stderr,"[totk-probe] StandardAllocator::Allocate self=%llx size=%llx align=%llx\n",(unsigned long long)(uintptr_t)self,(unsigned long long)size,(unsigned long long)align);}void *r=((void*(*)(void*,uint64_t,uint64_t))runtime_symbol("_ZN2nn3mem17StandardAllocator8AllocateEmm"))(self,size,align);if(!r)fprintf(stderr,"[totk-probe]   -> null\n");return r;}
+/* TEMP probe (OoT boot): the game's job system deadlocks on a LightEvent — trace the pair. */
+static void lv_log(const char *tag, void *ev){unsigned char*p=ev;uint64_t tid;pthread_threadid_np(NULL,&tid);
+ fprintf(stderr,"[lv-probe] %s th=%llx ev=%llx [%02x %02x %02x %02x %02x %02x %02x %02x]\n",tag,(unsigned long long)tid,(unsigned long long)(uintptr_t)ev,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);fflush(stderr);}
+static void observed_light_wait(void *ev){lv_log("W ",ev);
+ ((void(*)(void*))runtime_symbol("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE"))(ev);fprintf(stderr,"[lv-probe] W  -> done\n");fflush(stderr);}
+static uint32_t observed_light_timedwait(void *ev,uint64_t ts){lv_log("TW",ev);
+ uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"))(ev,ts);fprintf(stderr,"[lv-probe] TW -> %x\n",r);fflush(stderr);return r;}
+static void observed_light_signal(void *ev){lv_log("S ",ev);
+ ((void(*)(void*))runtime_symbol("_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE"))(ev);}
+static void observed_light_clear(void *ev){lv_log("C ",ev);
+ ((void(*)(void*))runtime_symbol("_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE"))(ev);}
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
- {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};
+ {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE",observed_query_mem_info},{"_ZN2nn2os17SetMemoryHeapSizeEm",observed_set_heap_size},{"_ZN2nn2os19AllocateMemoryBlockEPmm",observed_alloc_block},{"_ZN2nn3mem17StandardAllocator8AllocateEmm",observed_std_alloc},{"_ZN2nn3mem17StandardAllocator10InitializeEPvmb",observed_std_init},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main},{"nndiagAbort",observed_abort},{"_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE",observed_light_wait},{"_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE",observed_light_timedwait},{"_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE",observed_light_signal},{"_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE",observed_light_clear}};
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
 void *runtime_override(const char *name) {
@@ -494,7 +520,26 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
     (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
     SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
  case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
- case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
+ case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);
+    {volatile uint32_t *tlr=pthread_getspecific(runtime_keys[2]);fprintf(stderr,"[totk-probe] tlr=%p +0x110 thread id=%u\n",(void *)tlr,tlr?tlr[0x110/4]:0xDEAD);}
+    for(unsigned k=0;k<28;k++){uint64_t v=r[k];if(!v||v==~0ull)continue;char buf[201];vm_size_t got=0;   /* TEMP probe: any register holding a string (assert expression, file) */
+      if(vm_read_overwrite(mach_task_self(),(vm_address_t)v,200,(vm_address_t)buf,&got)==KERN_SUCCESS){size_t n=0;while(n<got&&buf[n]>=0x20&&buf[n]<0x7f)n++;if(n>=4){buf[n]=0;fprintf(stderr,"[totk-probe] x%u -> \"%s\"\n",k,buf);}}}
+    {uint64_t sp=r[31];for(unsigned k=0;k<128;k++){uint64_t v=0;vm_size_t got=0;   /* TEMP probe: strings spilled on the guest stack (assert arguments) */
+      if(vm_read_overwrite(mach_task_self(),(vm_address_t)(sp+k*8),8,(vm_address_t)&v,&got)!=KERN_SUCCESS)break;
+      if(!v||v==~0ull)continue;char buf[201];
+      if(vm_read_overwrite(mach_task_self(),(vm_address_t)v,200,(vm_address_t)buf,&got)==KERN_SUCCESS){size_t n=0;while(n<got&&buf[n]>=0x20&&buf[n]<0x7f)n++;if(n>=6){buf[n]=0;fprintf(stderr,"[totk-probe] sp+%x -> \"%s\"\n",k*8,buf);}}}}     {uint8_t *gs=runtime_symbol("_ZN2nn2os13GetSystemTickEv")-0x166370;uint64_t q;
+      for(unsigned k=0;k<2;k++){unsigned off=k?0xeb0020:0xeb0018;memcpy(&q,gs+off,8);fprintf(stderr,"[totk-probe] sdk slot %x -> %llx (delta %llx)\n",off,(unsigned long long)q,(unsigned long long)q-(unsigned long long)(uintptr_t)gs);}
+      memcpy(&q,gs+0xe8fa38,8);fprintf(stderr,"[totk-probe] clock_gettime slot -> %llx (delta %llx)\n",(unsigned long long)q,(unsigned long long)q-(unsigned long long)(uintptr_t)gs);}
+    runtime_trace_guest(r[29],r[30]);
+    {   /* TEMP probe (OoT): the frame chain died at a stub — scan the stack for anything that looks like a return address */
+        static const char *nm[]={"main","subsdk0","sdk"}; static const size_t sz[]={0x8700000,0x120000,0x1200000};
+        uint64_t sp=r[29]-0x200;   /* the guest frame chain died at the stub; scan around the live fp for return-address-looking values */
+        for(unsigned k=0;k<256;k++){uint64_t v=0;vm_size_t got=0;
+            if(vm_read_overwrite(mach_task_self(),(vm_address_t)(sp+k*8),8,(vm_address_t)&v,&got)!=KERN_SUCCESS)break;
+            for(unsigned i=0;i<3;i++){uint8_t *b=runtime_module_base(nm[i]);if(!b)continue;
+                if(v>=(uintptr_t)b&&v<(uintptr_t)b+sz[i]){fprintf(stderr,"[totk-probe] sp+%x -> %s+%llx\n",k*8,nm[i],(unsigned long long)(v-(uintptr_t)b));break;}}}
+    }
+    if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}
  default:fprintf(stderr,"[totk] unimplemented SVC 0x%x at %s+%#llx\n",num,module,(unsigned long long)offset);if(num==0x1f)fprintf(stderr,"[totk] named port %.12s\n",(const char *)(uintptr_t)r[1]);runtime_trace_guest(r[29],r[30]);runtime_fail("system service not implemented");return 0;

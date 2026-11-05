@@ -678,8 +678,12 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
 // ---------- 锁 ----------
 // ---------- Locks ----------
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST); }
+static inline uint64_t ld64(uint64_t a) { return __atomic_load_n((uint64_t *)a, __ATOMIC_SEQ_CST); }
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+static inline int cas64(uint64_t a, uint64_t *exp, uint64_t v) { return __atomic_compare_exchange_n((uint64_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+static uint64_t gread64(uint64_t a) { uint64_t x = 0; vm_size_t g = 0;   /* TEMP probe helper (OoT) */
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)a, 8, (vm_address_t)&x, &g) != KERN_SUCCESS) return ~0ull; return x; }
 
 #ifdef GAME_BOTW
 /* A thread's lock tag is its own handle (the SDK reads it from the ThreadType at TLR+0x1f8). Any other tag means two
@@ -1100,23 +1104,67 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = 0; return 1;
     }
 
-    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等、3 64 位相等则等（Switch 2 SDK） | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less then wait, 2 wait if equal, 3 wait if equal (64-bit, Switch 2 SDK; Lichii #87 found Ocarina needs it)
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
         pthread_mutex_lock(&G);
-        int64_t r; uint32_t v = ld32(addr);
-        int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+        int64_t r; uint32_t v = 0; int ok;
+        if (type == 3) ok = ld64(addr) == regs[2];
+        else { v = ld32(addr); ok = type == 2 ? (int32_t)v == val : (int32_t)v < val; }
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
         if (!ok) r = R_BAD_STATE;
-        else { t->waddr = addr; r = block(t, 3, (int64_t)regs[3]); }
+        else { t->waddr = addr;
+            /* TEMP probe (OoT boot): a thread repeating zero/near-zero timed waits is a spin. */
+            static int tw_count;
+            if (getenv("TOTK_WAIT_LOG") && (int64_t)regs[3] >= 0 && tw_count < 12) { tw_count++;
+                fprintf(stderr, "[wait-probe] th=%u timed-wait addr=%llx type=%d timeout=%lld\n", t->handle, (unsigned long long)addr, type, (long long)(int64_t)regs[3]); }
+            /* TEMP probe (OoT boot): infinite address waits are the real blockers; the mutex word names its holder. */
+            struct wseen { uint64_t a; uint32_t h; }; static struct wseen seen[64]; static int nseen;
+            /* TEMP probe (OoT): dump the render pass (main+0x40cd20) gate fields live, at steady state. */
+            static int main_waits;
+            if (t->handle == 0x1001 && ++main_waits == 300 && getenv("TOTK_WAIT_LOG")) {
+                uint8_t *mb = runtime_module_base("main");
+                uint64_t sp0 = regs[29] - 0x100;
+                for (unsigned k = 0; k < 1024; k++) { uint64_t v = 0; vm_size_t got = 0;
+                    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + k * 8), 8, (vm_address_t)&v, &got) != KERN_SUCCESS) break;
+                    if (mb && v == (uint64_t)(mb + 0x346c73c)) {   /* frame fn's return address: [slot+0x10] = saved x19 */
+                        uint64_t obj = 0;
+                        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + k * 8 + 0x10), 8, (vm_address_t)&obj, &got) == KERN_SUCCESS) {
+
+                            #define MO(a) ((a) >= (uintptr_t)mb && (a) < (uintptr_t)mb + 0x8700000 ? (unsigned long long)((a) - (uintptr_t)mb) : 0ull)
+                            fprintf(stderr, "[wait-probe] frame-obj %llx: 24f=%llx 248=%x ab=%llx 50=%x 88=%x 24d=%llx 188=%llx(m+%llx) 180=%llx\n",
+                                (unsigned long long)obj, gread64(obj + 0x248) >> 8 & 0xff, (unsigned)gread64(obj + 0x248), (unsigned long long)(gread64(obj + 0xa8) >> 24 & 0xff),
+                                (unsigned)gread64(obj + 0x50), (unsigned)gread64(obj + 0x88), (unsigned long long)(gread64(obj + 0x248) >> 32 & 0xff),
+                                (unsigned long long)gread64(obj + 0x188), MO(gread64(obj + 0x188)), (unsigned long long)gread64(obj + 0x180));
+                            uint64_t s = gread64((uint64_t)(mb + 0x4e7f6c8));
+                            fprintf(stderr, "[wait-probe]   bss 4d48f0=%llx(m+%llx) 4d4950=%llx(m+%llx) singleton=%llx idx164=%x cnt168=%x\n",
+                                (unsigned long long)gread64((uint64_t)(mb + 0x4d48f0)), MO(gread64((uint64_t)(mb + 0x4d48f0))),
+                                (unsigned long long)gread64((uint64_t)(mb + 0x4d4950)), MO(gread64((uint64_t)(mb + 0x4d4950))),
+                                (unsigned long long)s, s != ~0ull ? (unsigned)(gread64(s + 0x164) & 0xffffffff) : 0, s != ~0ull ? (unsigned)(int32_t)gread64(s + 0x168) : 0);
+                        }
+                        break; } } }
+            if ((int64_t)regs[3] < 0 && getenv("TOTK_WAIT_LOG")) {
+                int dup = 0; for (int i = 0; i < nseen; i++) if (seen[i].a == addr && seen[i].h == t->handle) dup = 1;
+                if (!dup && nseen < 64) { seen[nseen++] = (struct wseen){addr, t->handle};
+                    fprintf(stderr, "[wait-probe] th=%u addr=%llx type=%d val=%d now=%llx\n", t->handle, (unsigned long long)addr, type, val, (unsigned long long)(type == 3 ? ld64(addr) : ld32(addr)));
+                    static const char *nm[] = {"main", "subsdk0", "sdk"}; static const size_t sz[] = {0x8700000, 0x120000, 0x1200000};
+                    uint64_t sp = regs[29] - 0x100; int shown = 0;   /* TEMP probe (OoT): name each parked thread by its return addresses */
+                    for (unsigned k = 0; k < 192 && shown < 10; k++) { uint64_t v = 0; vm_size_t got = 0;
+                        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp + k * 8), 8, (vm_address_t)&v, &got) != KERN_SUCCESS) break;
+                        for (unsigned i = 0; i < 3; i++) { uint8_t *b = runtime_module_base(nm[i]); if (!b) continue;
+                            if (v >= (uintptr_t)b && v < (uintptr_t)b + sz[i]) { fprintf(stderr, "[wait-probe]   +%x %s+%llx\n", k * 8, nm[i], (unsigned long long)(v - (uintptr_t)b)); shown++; break; } } }
+                }
+            }
+            r = block(t, 3, (int64_t)regs[3]); }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
+    case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒、3 64 位相等则加一并唤醒（Switch 2 SDK） | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake, 3 increment if equal (64-bit, Switch 2 SDK)
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         pthread_mutex_lock(&G);
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
-        if (type != 0) {
+        if (type == 3) { uint64_t e = regs[2]; if (!cas64(addr, &e, e + 1)) r = R_BAD_STATE; }
+        else if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
                 // 全部唤醒（个数 <= 0）且有等待者时减 2，不是减 1（mesosphère KAddressArbiter::SignalAndModifyByWaitingCountIfEqual，Ryujinx、yuzu 一致；nxnative d47f899 在 Engage 上查到）
@@ -1128,7 +1176,12 @@ int svc_thread(int num, uint64_t *regs) {
             if (!cas32(addr, &e, (uint32_t)nv)) r = R_BAD_STATE;
         }
         if (!r) { int n = 0;
-            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0); }
+            for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(3, addr)); n++) wake(w, 0);
+            /* TEMP probe (OoT boot): pair with the wait probe. */
+            static uint64_t sl[64]; static int ns;
+            if (getenv("TOTK_WAIT_LOG")) { int dup = 0; for (int i = 0; i < ns; i++) if (sl[i] == addr) dup = 1;
+                if (!dup && ns < 64) { sl[ns++] = addr; fprintf(stderr, "[wait-probe] th=%u signal addr=%llx type=%d val=%d woke=%d\n", cur() ? cur()->handle : 0, (unsigned long long)addr, type, val, n); } }
+        }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -1160,6 +1213,10 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
         pthread_mutex_lock(&G);
         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
+        /* TEMP probe (OoT boot): who waits on which handles; pair with the bind/wake probes. */
+        if (getenv("TOTK_WAIT_LOG")) { static uint64_t seen[64]; static int nsw; uint64_t key = (uint64_t)n << 56 | (n ? hs[0] : 0);
+            int dup = 0; for (int i = 0; i < nsw; i++) if (seen[i] == key) dup = 1;
+            if (!dup && nsw < 64) { seen[nsw++] = key; fprintf(stderr, "[wait-probe] th=%u WaitSync n=%d h0=%x timeout=%lld\n", t->handle, n, n ? hs[0] : 0, (long long)ns); } }
         int64_t r; int idx = -1;
         for (;;) {
             if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
@@ -1228,6 +1285,7 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     uint32_t r = create(ev, autoclear, 1);
     if (r) die("CreateSystemEvent 失败 %#x", r);
     wh = getw(ev);
+    if (getenv("TOTK_WAIT_LOG")) fprintf(stderr, "[wait-probe] bind SystemEvent ev=%p -> wh=%x by th=%u\n", ev, wh, cur() ? cur()->handle : 0);   /* TEMP probe (OoT boot) */
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
@@ -1278,6 +1336,10 @@ uint32_t runtime_event_readable(uint32_t hw) {
 void runtime_event_signal(uint32_t hw) {
     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+}
+// Is this handle the writable end of a live event? Services use it to pick the client's event out of copy handles.
+int runtime_handle_is_event_w(uint32_t h) {
+    pthread_mutex_lock(&G); int ok = h_peek(h, O_EVENT_W) != NULL; pthread_mutex_unlock(&G); return ok;
 }
 
 // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------

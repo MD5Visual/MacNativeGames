@@ -414,10 +414,13 @@ static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
 static void defer_drain(void) { @autoreleasepool {   // also called from GPU completion handlers
     NSMutableArray<NvDeferredRelease *> *ready = [NSMutableArray array];
     pthread_mutex_lock(&g_deferred_mu);
+    NSMutableArray<NvDeferredRelease *> *pending = [NSMutableArray array];   // one linear pass: removeObjectAtIndex per hit is O(n^2), and a heavy scene load queues hundreds of thousands of references (seen on Ocarina of Time)
     for (NSInteger i = g_deferred.count - 1; i >= 0; i--) {
         NvDeferredRelease *d = g_deferred[(NSUInteger)i];
-        if (d->fence <= g_done) { [ready addObject:d]; [g_deferred removeObjectAtIndex:(NSUInteger)i]; }
+        if (d->fence <= g_done) [ready addObject:d]; else [pending addObject:d];
     }
+    [g_deferred removeAllObjects];
+    [g_deferred addObjectsFromArray:pending];
     pthread_mutex_unlock(&g_deferred_mu);
     for (NvDeferredRelease *d in ready) {
         id obj = d->object;

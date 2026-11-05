@@ -83,6 +83,111 @@ static uint32_t socket_htonl(uint32_t v) { return htonl(v); }
 static uint16_t socket_htons(uint16_t v) { return htons(v); }
 static const char *socket_ntop(int family, const void *in, char *out, uint32_t size) { return family == 2 ? inet_ntop(AF_INET, in, out, size) : NULL; }
 
+/* ---------- nn::socket event counters (eventfd): gRPC's poller (NPLN, in main) and the movie TaskQueue (subsdk0)
+   wake through these; with them cut, gRPC finds no poll engine and aborts at boot (Ocarina of Time). Linux eventfd
+   semantics, small table. Poll readiness is a 1 ms sleep loop (ponytail: condvars if wakeup latency ever matters). ---------- */
+#include <pthread.h>
+#include <time.h>
+#define EVFDS 64
+#define EV_BASE 512            /* stay below select()'s 1024-bit set, away from host fds (as nxnative does) */
+#define EV_SEMAPHORE 1u
+#define EV_NONBLOCK 4u
+#define EV_MAX 0xfffffffffffffffeull
+static struct { uint64_t count; unsigned flags; int used; } evfd[EVFDS];
+static pthread_mutex_t evfd_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ev_error(int e) { socket_errno = e; return -1; }   /* Linux errnos: the game reads them via nnsocketGetLastErrno */
+static int ev_fd(int fd) { return fd >= EV_BASE && fd < EV_BASE + EVFDS && evfd[fd - EV_BASE].used ? fd - EV_BASE : -1; }
+static int ev_event_fd(uint64_t init, unsigned flags) {
+    if (init == EV_MAX + 1) return ev_error(22);   /* EINVAL, as eventfd(2) */
+    pthread_mutex_lock(&evfd_lock);
+    for (int i = 0; i < EVFDS; i++) if (!evfd[i].used) { evfd[i].count = init; evfd[i].flags = flags; evfd[i].used = 1; pthread_mutex_unlock(&evfd_lock); return EV_BASE + i; }
+    pthread_mutex_unlock(&evfd_lock);
+    return ev_error(24);   /* EMFILE */
+}
+static int ev_read(int fd, uint64_t *out) {
+    int i = ev_fd(fd); if (i < 0) return ev_error(9);   /* EBADF */
+    for (;;) {
+        pthread_mutex_lock(&evfd_lock);
+        if (evfd[i].count) { *out = evfd[i].flags & EV_SEMAPHORE ? (evfd[i].count--, 1) : (evfd[i].count = 0, *out); pthread_mutex_unlock(&evfd_lock); return 8; }
+        pthread_mutex_unlock(&evfd_lock);
+        if (evfd[i].flags & EV_NONBLOCK) return ev_error(11);   /* EAGAIN */
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);   /* blocking read: wait for a write */
+    }
+}
+static int ev_write(int fd, uint64_t v) {
+    int i = ev_fd(fd); if (i < 0) return ev_error(9);
+    if (!v) return ev_error(22);
+    for (;;) {
+        pthread_mutex_lock(&evfd_lock);
+        if (evfd[i].count <= EV_MAX - v) { evfd[i].count += v; pthread_mutex_unlock(&evfd_lock); return 8; }
+        pthread_mutex_unlock(&evfd_lock);
+        if (evfd[i].flags & EV_NONBLOCK) return ev_error(11);
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);   /* counter full: wait for a read */
+    }
+}
+static void ev_sleep_us(long us) { struct timespec ts = {us / 1000000, (us % 1000000) * 1000}; nanosleep(&ts, NULL); }
+static int ev_poll(void *fds_, unsigned nfds, int timeout_ms) {   /* struct pollfd {int fd; short events; short revents} */
+    struct { int fd; short events, revents; } *fds = fds_;
+    /* TEMP probe (OoT boot): what the movie TaskQueue and gRPC poll for. */
+    static int ep_count;
+    if (getenv("TOTK_WAIT_LOG") && ep_count < 10) { ep_count++;
+        fprintf(stderr, "[wait-probe] poll nfds=%u timeout=%d fds:", nfds, timeout_ms);
+        for (unsigned k = 0; k < nfds && k < 8; k++) fprintf(stderr, " %d/%x", fds[k].fd, fds[k].events);
+        fprintf(stderr, "\n"); }
+    long waited = 0;
+    for (;;) {
+        int ready = 0;
+        pthread_mutex_lock(&evfd_lock);
+        for (unsigned k = 0; k < nfds; k++) { fds[k].revents = 0; int i = ev_fd(fds[k].fd);
+            if (i >= 0) { if ((fds[k].events & 1) && evfd[i].count) fds[k].revents |= 1; if ((fds[k].events & 4) && evfd[i].count < EV_MAX) fds[k].revents |= 4; if (fds[k].revents) ready++; } }
+        pthread_mutex_unlock(&evfd_lock);
+        if (ready || (timeout_ms >= 0 && waited >= timeout_ms * 1000L)) return ready;
+        ev_sleep_us(1000); waited += 1000;
+    }
+}
+static int ev_select(int nfds, void *rin_, void *win_, void *ein_, void *tv_) {   /* FdSet: 32 u32 words; TimeVal {sec,usec} */
+    unsigned *rin = rin_, *win = win_, *ein = ein_;
+    /* TEMP probe (OoT boot): the movie TaskQueue selects on what? */
+    static int es_count;
+    if (getenv("TOTK_WAIT_LOG") && es_count < 10) { es_count++;
+        fprintf(stderr, "[wait-probe] select nfds=%d bits r:", nfds);
+        for (int w = 0; w < 32; w++) if (rin && rin[w]) fprintf(stderr, " w%d=%x", w, rin[w]);
+        fprintf(stderr, " w:");
+        for (int w = 0; w < 32; w++) if (win && win[w]) fprintf(stderr, " w%d=%x", w, win[w]);
+        fprintf(stderr, " tv=%lld.%09ld\n", tv_ ? (long long)((long *)tv_)[0] : -1, tv_ ? (long)((long *)tv_)[1] : 0L); }
+    long budget = -1;   /* microseconds */
+    if (tv_) { long long s = ((long *)tv_)[0], u = ((long *)tv_)[1]; budget = s * 1000000 + u; }
+    long waited = 0;
+    for (;;) {
+        int ready = 0;
+        pthread_mutex_lock(&evfd_lock);
+        for (int i = 0; i < EVFDS && EV_BASE + i < nfds; i++) {
+            int w = (EV_BASE + i) >> 5, b = 1u << ((EV_BASE + i) & 31);
+            int r = (rin && rin[w] & b) || (ein && ein[w] & b), wr = win && win[w] & b;
+            int hit = (r && evfd[i].count) || (wr && evfd[i].count < EV_MAX);
+            if (rin) rin[w] = (rin[w] & ~b) | (hit && r && evfd[i].count ? b : 0);
+            if (win) win[w] = (win[w] & ~b) | (hit && wr ? b : 0);
+            if (ein) ein[w] &= ~b;
+            if (hit) ready++;
+        }
+        pthread_mutex_unlock(&evfd_lock);
+        if (ready || (budget >= 0 && waited >= budget)) return ready;
+        ev_sleep_us(1000); waited += 1000;
+    }
+}
+static int ev_close(int fd) {
+    int i = ev_fd(fd); if (i < 0) return ev_error(9);
+    pthread_mutex_lock(&evfd_lock); evfd[i].used = 0; pthread_mutex_unlock(&evfd_lock);
+    return 0;
+}
+static int ev_fcntl(int fd, unsigned cmd, unsigned long arg) {   /* F_GETFL=3 F_SETFL=4; O_NONBLOCK=2048 */
+    int i = ev_fd(fd); if (i < 0) return ev_error(9);
+    if (cmd == 3) return (int)((evfd[i].flags & EV_NONBLOCK) ? 2048 : 0);
+    if (cmd == 4) { pthread_mutex_lock(&evfd_lock); if (arg & 2048) evfd[i].flags |= EV_NONBLOCK; else evfd[i].flags &= ~EV_NONBLOCK; pthread_mutex_unlock(&evfd_lock); return 0; }
+    return 0;
+}
+static int ev_set_error(int e) { socket_errno = e; return 0; }
+
 /* ---------- nn::crypto ---------- */
 static void random_bytes(void *out, uint64_t n) { arc4random_buf(out, (size_t)n); }
 
@@ -126,6 +231,20 @@ void *runtime_offline_override(const char *name) {
            filter's setup are accepted; SSL, friends, local wireless, data delivery and the network request report the
            network unavailable, so the game keeps to its offline paths. */
         {"_ZN2nn6socket13IsInitializedEv", socket_ready}, {"_ZN2nn6socket4ReadEiPvm", socket_down}, {"_ZN2nn6socket5WriteEiPKvm", socket_down},
+        /* Event counters (Ocarina of Time): gRPC's poller and the movie TaskQueue wake through these; without them gRPC
+           finds no poll engine and aborts at boot. The C forms are what the game's gRPC imports. */
+        {"_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", ev_event_fd}, {"_ZN2nn6socket11EventFdReadEiPm", ev_read}, {"_ZN2nn6socket12EventFdWriteEim", ev_write},
+        {"_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", ev_select}, {"_ZN2nn6socket5CloseEi", ev_close},
+        {"nnsocketClose", ev_close}, {"nnsocketFcntl", ev_fcntl}, {"nnsocketPoll", ev_poll},
+         /* The C socket forms the game's gRPC imports: answer them here (ENETDOWN) instead of letting the SDK's BSD
+            client talk to a bsd: service that does not exist - gRPC then fails connects fast and stops retry-spinning
+            (same cut as nxnative's hle_net.c). */
+         {"nnsocketSocket", socket_down}, {"nnsocketConnect", socket_down}, {"nnsocketBind", socket_down}, {"nnsocketListen", socket_down},
+         {"nnsocketAccept", socket_down}, {"nnsocketShutdown", socket_down}, {"nnsocketSend", socket_down}, {"nnsocketRecv", socket_down},
+         {"nnsocketSendMsg", socket_down}, {"nnsocketRecvMsg", socket_down}, {"nnsocketGetPeerName", socket_down}, {"nnsocketGetSockName", socket_down},
+         {"nnsocketGetSockOpt", socket_down}, {"nnsocketSetSockOpt", socket_down},
+         {"nnsocketGetAddrInfo", socket_addr_info}, {"nnsocketGetAddrInfoWithOptions", socket_addr_info}, {"nnsocketFreeAddrInfo", socket_free_addr_info},
+        {"nnsocketGetLastErrno", socket_last_error}, {"nnsocketSetLastErrno", ev_set_error},
         {"_ZN2nn6socket11GetPeerNameEiP8sockaddrPj", socket_down},
         {"_ZN2nn2oe17EnableCrashReportEv", nothing}, {"_ZN2nn2oe18DisableCrashReportEv", nothing},
         {"_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", nothing},

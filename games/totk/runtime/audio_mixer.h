@@ -36,9 +36,7 @@ typedef struct AudioRenderer {
     AudrenParameter param;
     pthread_mutex_t lock; pthread_t thread; int running;
     uint32_t state, revision, time_limit, event; int logged;
-#ifdef GAME_BOTW
-    float voice_drop; int voice_drop_set;   /* SetVoiceDropParameter (15.0.0+, Breath of the Wild 1.9.0): kept, never used */
-#endif
+    float voice_drop; int voice_drop_set;   /* SetVoiceDropParameter (15.0.0+, BotW 1.9.0 and Switch 2 titles): kept, never used */
     uint64_t behavior_flags, elapsed_frames;
     uint64_t stop_released, empty_played, flushed, logged_released;   /* wave buffers given back by Stop / without samples / by FlushWaveBuffers */
     ServerVoice *voices; AudrenPoolIn *pools; AudrenMixIn *mixes; AudrenSinkIn *sinks; AudrenEffectIn *effects; AudrenChannelIn *channels;

@@ -122,6 +122,15 @@ static unsigned to_posix_rule(int *count, int64_t *out, int n, const CalendarTim
     time_t v = mktime(&tm); if (count) *count = n > 0; if (n > 0 && out) out[0] = (int64_t)v; return 0;
 }
 static int64_t network_clock_now(void) { return (int64_t)time(NULL); }   /* StandardNetworkSystemClock::now: the Mac's clock, as GetCurrentTime */
+/* The SDK's exported clock_gettime (musl) sends CLOCK_MONOTONIC through an ifunc slot to its time:u
+   shared-memory client, which has no page here: OoT's std::chrono::steady_clock::now() then threw
+   "clock_gettime(CLOCK_MONOTONIC) failed" and the SDK VAborted (main+0x10f7bc, SDK 22.2.8). Take over the
+   symbol and answer both ids from the Mac's clock, the same time base as the cntpct gate. */
+static int host_clock_gettime(int id, struct timespec *out) {
+    if (!out || (id != 0 && id != 1)) return -1;   /* the guest wrapper rejects other ids too */
+    struct timespec ts; clock_gettime(id ? CLOCK_MONOTONIC : CLOCK_REALTIME, &ts);
+    out->tv_sec = ts.tv_sec; out->tv_nsec = ts.tv_nsec; return 0;
+}
 /* AsyncEnsureNetworkClockAvailabilityTask: the network clock is the Mac's, available at once; its finish event is signalled. */
 static uint8_t clock_task_event[0x80] __attribute__((aligned(16)));
 static void clock_task_noop(void *self) { (void)self; }
@@ -131,6 +140,7 @@ static void *clock_task_event_get(void *self) { (void)self; static int bound; if
 void *runtime_time_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn4time10InitializeEv", initialize}, {"_ZN2nn4time8FinalizeEv", finalize}, {"_ZN2nn4time13IsInitializedEv", is_initialized},
+        {"clock_gettime", host_clock_gettime},
         {"_ZN2nn4time23StandardUserSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", user_time},
         {"_ZN2nn4time26StandardNetworkSystemClock14GetCurrentTimeEPNS0_9PosixTimeE", user_time},
         {"_ZN2nn4time19StandardSteadyClock3nowEv", steady_clock_now},

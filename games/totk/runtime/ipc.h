@@ -47,6 +47,7 @@ void *runtime_handle_get(uint32_t h, int session);
 uint32_t runtime_event_new(void);
 uint32_t runtime_event_readable(uint32_t writable);
 void runtime_event_signal(uint32_t writable);
+int runtime_handle_is_event_w(uint32_t h);   /* threads.c: is h a live writable event end? */
 void runtime_ipc_session_closed(void *session);
 void runtime_ipc_tmem_closed(void *tmem);
 

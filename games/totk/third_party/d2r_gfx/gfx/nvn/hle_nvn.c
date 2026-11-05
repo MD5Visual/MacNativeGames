@@ -180,8 +180,10 @@ static const int g_devinfo[] = {
     [0x00] = 53, [0x01] = 311,  // Breath of the Wild 1.6.0 main+0xe55304 requires major 53, minor >= 311 (botw.md).
 #elif defined(GAME_NS2)
     // NVN2 (Switch 2): Donkey Kong Bananza requires major 231, minor >= 30 and creates no graphics system otherwise (a null
-    // read in its frame loop); found by seedds/nxnative (8dd0c98a, MIT).
-    [0x00] = 231, [0x01] = 30,
+    // read in its frame loop); found by seedds/nxnative (8dd0c98a, MIT). Ocarina of Time's graphics init (main+0x346be50)
+    // returns early unless minor >= 0x28, leaving its device singleton null; the real console reports one value for all
+    // titles, so answer the highest requirement seen.
+    [0x00] = 231, [0x01] = 40,
 #else
     [0x00] = 55, [0x01] = 15,   // Experimental ABI target: TOTK main+e9d614 requires major 55, minor >= 15. Unsupported functions stop.
 #endif
@@ -2999,6 +3001,20 @@ NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow
 
 // 帧边界：每次出图打印 / 落盘本帧各 NVN 函数调用次数
 // Frame boundary: on each present, print / write to disk the call count of each NVN function for this frame
+/* TEMP probe (OoT boot): diff the per-function counters while the game runs without presenting. */
+static void *nvn_watch_thread(void *_) {
+    (void)_;
+    static uint64_t snap[NVN_NFUNC];
+    for (unsigned i = 0; i < NVN_NFUNC; i++) snap[i] = atomic_load(&nvn_slot[i].cnt);
+    for (int round = 0; round < 12; round++) {
+        sleep(10);
+        for (unsigned i = 0; i < NVN_NFUNC; i++) {
+            uint64_t c = atomic_load(&nvn_slot[i].cnt);
+            if (c != snap[i]) { fprintf(stderr, "[nvn-probe] +%llu %s\n", (unsigned long long)(c - snap[i]), nvn_names[i]); snap[i] = c; }
+        }
+    }
+    return NULL;
+}
 static uint64_t g_prev[NVN_NFUNC];
 static FILE *g_tsv;
 static void dump_frame(void) {
@@ -3024,6 +3040,10 @@ static void dump_frame(void) {
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu：%u 个函数 %llu 次调用 |%s", g_frame ? "帧" : "初始化", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] 帧 %llu：%u 个函数 %llu 次调用", g_frame, nfn, total);
     g_frame++; g_frame_pub = g_frame; cs_dump();
+    {   /* TEMP probe (OoT boot): the game loops without presenting — watch which NVN functions still get calls. */
+        static int watcher;
+        if (!watcher && getenv("TOTK_WAIT_LOG")) { watcher = 1; pthread_t t; pthread_create(&t, NULL, nvn_watch_thread, NULL); pthread_detach(t); }
+    }
     /* TOTK_BENCH_FRAMES=<file> (benchmark, 2026-10-20): "<frame> <ns>" at every game frame, on the clock the survey
        reports use (scripts/bench_run.py cuts the run into its fly segments by those frame numbers). */
     { static FILE *bf; static int on = -1;

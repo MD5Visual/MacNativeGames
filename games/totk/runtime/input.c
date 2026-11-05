@@ -250,11 +250,14 @@ extern void runtime_front_request_close(void);
 __attribute__((weak)) int runtime_mem_scan_command(const char *line) { (void)line; return 0; }
 static void *input_file(void *arg) {
     FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
+    fprintf(stderr, "[totk-input] diagnostic input thread polling %s\n", (const char *)arg);   /* TEMP probe */
     char line[1200];
     for (;;) {
         if (!fgets(line, sizeof line, f)) {
             if (ferror(f)) runtime_fail("diagnostic input read");
+            static int once; if (!once) { once=1; fprintf(stderr, "[totk-input] EOF branch reached\n"); }   /* TEMP probe */
             clearerr(f); usleep(100000);
+            { struct stat n2,h2; if (!stat((const char *)arg,&n2) && !fstat(fileno(f),&h2)) { static int rep; rep++; if (rep<=5 || rep%50==1) fprintf(stderr,"[totk-input] iter %d path ino=%lld fd ino=%lld\n",rep,(long long)n2.st_ino,(long long)h2.st_ino); } }   /* TEMP probe */
             /* A file replaced instead of appended to (devicectl device copy to an iPhone's Documents writes a new file, so
                this stream would stay on the old one and never see another line): open the new one. The writer copies the
                whole command list again, so it is read on from where the old one ended; a shorter file is a new list, read

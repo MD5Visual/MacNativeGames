@@ -11,6 +11,7 @@ import json
 import struct
 from pathlib import Path
 import lz4.block
+import zbic
 
 
 def check(ok, message):
@@ -33,7 +34,10 @@ def prepare(source, destination):
         stored = compressed[i] if flags & (1 << i) else size
         check(fileoff + stored <= len(raw) and size <= 256 * 1024 * 1024, 'Invalid NSO segment')
         payload = raw[fileoff:fileoff + stored]
-        data = lz4.block.decompress(payload, uncompressed_size=size) if flags & (1 << i) else payload
+        if flags & (1 << i):
+            data = zbic.decompress(payload) if payload[:4] == b'ZBIC' else lz4.block.decompress(payload, uncompressed_size=size)   # Switch 2 toolchains: ZBIC wraps a zstd frame
+        else:
+            data = payload
         digest = hashlib.sha256(data).digest()
         check(len(data) == size, 'NSO decompression size mismatch')
         if flags & (8 << i):

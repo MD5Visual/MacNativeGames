@@ -2,6 +2,7 @@
 # NSO → memory image (same decoding as patch_nso.py); shared by the verification tools.
 import struct
 import lz4.block
+import zbic
 from relr import decode_relr
 
 
@@ -42,7 +43,9 @@ def load(path):
     img = bytearray(segs[2][1] + segs[2][2] + bss)
     for i, (fo, mo, sz) in enumerate(segs):
         raw = d[fo:fo + csz[i]]
-        if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
+        if flags >> i & 1:
+            if raw[:4] == b'ZBIC': raw = zbic.decompress(raw)   # Switch 2 toolchains: ZBIC wraps a zstd frame (same as patch_nso.py)
+            else: raw = lz4.block.decompress(raw, uncompressed_size=sz)
         img[mo:mo + sz] = raw
     return bytes(img)
 

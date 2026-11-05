@@ -23,6 +23,7 @@
 import struct, re, sys, os
 from itertools import combinations
 import lz4.block
+import zbic
 from capstone import *
 from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG   # spin waits (below)
 from call_window import BLR_X18, BLR_X30, prepare_call
@@ -38,7 +39,9 @@ csz = struct.unpack_from('<III', d, 0x60)
 IMG = bytearray(segs[2][1] + segs[2][2] + bss)
 for i, (fo, mo, sz) in enumerate(segs):
     raw = d[fo:fo + csz[i]]
-    if flags >> i & 1: raw = lz4.block.decompress(raw, uncompressed_size=sz)
+    if flags >> i & 1:
+        if raw[:4] == b'ZBIC': raw = zbic.decompress(raw)   # Switch 2 toolchains: ZBIC wraps a zstd frame (the zbic package swaps the magic)
+        else: raw = lz4.block.decompress(raw, uncompressed_size=sz)
     IMG[mo:mo + sz] = raw
 IMG0 = bytes(IMG)   # the image as decoded, before any rewrite (spin waits keep off every word that changes)
 TEXT_END = segs[0][2]
@@ -787,7 +790,21 @@ if calls:
         tag, value = struct.unpack_from('<qQ', IMG, dyn); dyn += 16
         if tag == 0: break
         tags[tag] = value
-    count = struct.unpack_from('<I', IMG, tags[4] + 4)[0]
+    if 4 in tags:
+        count = struct.unpack_from('<I', IMG, tags[4] + 4)[0]
+    else:   # a newer toolchain emits only DT_GNU_HASH: walk every chain to its end bit for the symbol count
+        gnu = tags[0x6ffffef5]
+        nb, symoff, bs, _ = struct.unpack_from('<IIII', IMG, gnu)
+        words = gnu + 16 + bs * 8 + nb * 4
+        last = -1
+        for h in struct.unpack_from(f'<{nb}I', IMG, gnu + 16 + bs * 8):
+            w = (h - symoff) // 32
+            while True:
+                word = struct.unpack_from('<I', IMG, words + 4 * w)[0]
+                if word >> 31 & 1: break
+                w += 1
+            last = max(last, 32 * w + word.bit_length() - 1)
+        count = symoff + last + 1
     for where, addend in decode_relr(IMG, tags, DATA_OFF, KEY_PAGE_OFF):
         assert addend not in call_targets, f'RELR pointer enters unprepared call: {where:x}'
     for i in range(count):

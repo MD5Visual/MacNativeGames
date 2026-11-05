@@ -1053,6 +1053,8 @@ void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) 
     case 13: { IpcBuffer b = out_buffer(rq, &pointer); put_name(&b, rs, pointer); return; }          /* GetActiveAudioOutputDeviceName [13.0.0+] */
     case 14: { IpcBuffer b = out_buffer(rq, &pointer); int32_t n = b.size >= 0x100 ? 1 : 0; if (n) put_name(&b, rs, pointer); IPC_OUT(rs, n); return; }   /* ListAudioOutputDeviceName [13.0.0+] */
     case 4: case 11: case 12: { static uint32_t ev; if (!ev) ev = runtime_event_new(); rs->copy[rs->ncopy++] = runtime_event_readable(ev); return; }   /* device change events: never signalled, the device does not change */
+    case 15: case 17: { static uint32_t ev2; if (!ev2) ev2 = runtime_event_new(); rs->copy[rs->ncopy++] = runtime_event_readable(ev2); return; }   /* AcquireAudio{Input,Output}DeviceNotification [17.0.0+]: same, never signalled */
+    case 16: case 18: return;                                                     /* ReleaseAudio{Input,Output}DeviceNotification [17.0.0+] */
     default: ipc_unimplemented(s, rq);
     }
 }

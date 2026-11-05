@@ -39,7 +39,6 @@ static AudioRenderer *renderer_new(const AudrenParameter *p) {
     r->channels = calloc((size_t)p->voice_count * 6, sizeof *r->channels);
     need(r->voices && r->pools && r->mixes && r->sinks && r->effects && r->channels, "renderer tables");
     pthread_mutex_init(&r->lock, NULL);
-    r->event = runtime_event_new();
     r->state = 1;   /* stopped */
     return r;
 }
@@ -324,12 +323,11 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
     case 7: rs->copy[rs->ncopy++] = runtime_event_readable(r->event); return;
     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;
     case 9: { uint32_t v = r->time_limit ? r->time_limit : 100; IPC_OUT(rs, v); return; }
-#ifdef GAME_BOTW
-    /* Set/GetVoiceDropParameter (15.0.0+, Breath of the Wild 1.9.0): the scale of the voice-drop estimate when rendering
-       runs over its time limit. This mixer never drops voices, so the value is only kept and given back (default 1). */
+    /* Set/GetVoiceDropParameter (15.0.0+; found on BotW 1.9.0 and Ocarina of Time Switch 2, whose call carries extra words):
+       the scale of the voice-drop estimate when rendering runs over its time limit. This mixer never drops voices, so the
+       value is only kept and given back (default 1). */
     case 12: r->voice_drop = IPC_ARG(rq, float, 0); r->voice_drop_set = 1; return;
     case 13: { float v = r->voice_drop_set ? r->voice_drop : 1.0f; IPC_OUT(rs, v); return; }
-#endif
     default: ipc_unimplemented(s, rq);
     }
 }
@@ -347,6 +345,14 @@ static void manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         AudrenParameter p = IPC_ARG(rq, AudrenParameter, 0);
         need(rq->ncopy >= 1, "OpenAudioRenderer handles");
         AudioRenderer *r = renderer_new(&p);
+        /* The C API nn::audio::OpenAudioRenderer hands the service the game's own wake event (the writable end of a
+           client SystemEvent) among the copy handles, next to the transfer memory; on device the service signals that
+           event every audio frame and the game's audio thread waits on it. Adopt it instead of the event we would make
+           ourselves — Ocarina of Time waited on its own event forever, its audio graph never ticked, the scene loop
+           queued no render jobs and the frame barrier deadlocked after the first presented frame (2026-11-05). */
+        r->event = 0;
+        for (unsigned i = 0; i < rq->ncopy; i++) if (runtime_handle_is_event_w(rq->copy[i])) { r->event = rq->copy[i]; break; }
+        if (!r->event) r->event = runtime_event_new();   /* no client event: keep the old self-made one */
         r->running = 1; audio_mixer_open(r);
         need(pthread_create(&r->thread, NULL, render_thread, r) == 0, "render thread");
         fprintf(stderr, "[totk-audio] renderer open %d Hz x%d, voices %d effects %d submixes %d sinks %d splitters %d/%d REV%d\n", p.sample_rate, p.sample_count,
@@ -369,11 +375,25 @@ static void user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     (void)s;
     rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioRendererManager", manager_handler, NULL, NULL);
 }
+/* auddmg:u, the Switch 2 audio device manager (nn::audio::devmgr::IUserSessionManager; Ocarina of Time's SDK 22 opens it
+   inside nn::audio::Initialize). Its IUserSession commands are not publicly documented: as with aud:u, every command is
+   logged and answered with an empty success until the game's needs are seen. */
+static void devmgr_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    fprintf(stderr, "[totk-audio] auddmg user session command %u (type %u, %u bytes of arguments, %u copy / %u move handles)\n", rq->cmd, rq->type, (unsigned)rq->data_size, rq->ncopy, rq->nmove);
+    (void)s; (void)rs;
+}
+static void devmgr_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
+    fprintf(stderr, "[totk-audio] auddmg:u command %u (type %u, %u bytes of arguments, %u copy / %u move handles)\n", rq->cmd, rq->type, (unsigned)rq->data_size, rq->ncopy, rq->nmove);
+    (void)s;
+    if (rq->cmd == 0) { rs->move[rs->nmove++] = runtime_ipc_new_session("IAudioDeviceManagerUser", devmgr_user_handler, NULL, NULL); return; }
+    ipc_unimplemented(s, rq);
+}
 #endif
 void runtime_audio_register(void) {
     runtime_ipc_register("audren:u", manager_handler, NULL, NULL);
 #ifdef GAME_NS2
     runtime_ipc_register("aud:u", user_handler, NULL, NULL);
+    runtime_ipc_register("auddmg:u", devmgr_handler, NULL, NULL);
 #endif
 }
 __attribute__((constructor)) static void register_audio(void) { runtime_audio_register(); }

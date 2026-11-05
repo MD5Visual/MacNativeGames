@@ -2,7 +2,7 @@ GFX_SRC := $(wildcard third_party/d2r_gfx/gfx/nvn/*.c third_party/d2r_gfx/gfx/nv
            $(wildcard zeldaVR/gfx/*.c zeldaVR/gfx/*.m)   # zeldaVR: the VR modules (off unless TOTK_VR_CONTROL is set)
 GFX_OBJECTS := $(addprefix build/gfx/,$(addsuffix .o,$(GFX_SRC)))
 NATIVE_OPT ?= -O2
-GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include
+GFX_FLAGS := -std=gnu11 -Wno-error -Wno-unused-function -Wno-unused-parameter -fobjc-arc -Ithird_party/d2r_gfx/gfx/nvn/include -Ithird_party/d2r_gfx/gfx/nvn   # the nvn directory too: zeldaVR may be a symbolic link, and clang resolves quoted includes from its real path
 
 PY := .venv/bin/python
 # GPU work outside build/totk-native waits for the game slot too (the game binary takes it itself): one game or GPU
@@ -91,6 +91,7 @@ $(eval $(call GAME_DATA,botw160,analysis/botw160-port/phase12-validation.json))
 $(eval $(call GAME_DATA,botw190,analysis/botw190-port/phase12-validation.json))
 $(eval $(call GAME_DATA,dkb,analysis/dkb-port/phase12-validation.json))
 $(eval $(call GAME_DATA,pkp,analysis/pkp-port/phase12-validation.json))
+$(eval $(call GAME_DATA,oot,analysis/oot-port/phase12-validation.json))
 
 .PHONY: runtime binary probe-loader boot
 
@@ -500,6 +501,18 @@ build/totk-native-pkp: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) $(GFX_
 runtime-pkp binary-pkp: SHADER_LIST ?= ../pokopia/assets/shader_list.tsv
 binary-pkp: build/totk-native-pkp build/pso_manifest.tsv build/pso_title.tsv
 runtime-pkp: binary-pkp game-data-pkp
+# ---- Switch 2: The Legend of Zelda: Ocarina of Time 1.1.1 (v131072) ----
+# As Bananza's targets above, with GAME_OOT (graphics objects in build/gfx-oot). Its modules are main, subsdk0 and sdk.
+GFX_OBJECTS_OOT := $(addprefix build/gfx-oot/,$(addsuffix .o,$(GFX_SRC)))
+build/gfx-oot/%.o: % $(GFX_HEADERS) Makefile
+	@mkdir -p "$(dir $@)"
+	xcrun clang $(NATIVE_OPT) -g -Wall -Wextra $(GFX_FLAGS) -DGAME_OOT=1 -DGAME_NS2=1 -c "$<" -o "$@"
+.PHONY: runtime-oot binary-oot
+build/totk-native-oot: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) $(GFX_OBJECTS_OOT) Makefile
+	xcrun clang -std=c11 $(NATIVE_OPT) -g -Wall -Wextra -Werror -Wno-deprecated-declarations -Ithird_party/d2r_gfx/gfx/nvn/include -DGAME_OOT=1 -DGAME_NS2=1 -Ibuild -I/opt/homebrew/opt/opus/include/opus -I/opt/homebrew/opt/libvpx/include runtime/loader.c runtime/game_data.c runtime/game_patches_ns2.c runtime/ns2_host.c runtime/ns2_codec.c runtime/ns2_audio_out.c runtime/ns2_opus_ms.c runtime/offline_host.c runtime/world_survey.c runtime/game_slot.c runtime/services.c runtime/romfs.c runtime/threads.c runtime/gate.S runtime/hle_stack.S runtime/hle_stack.c runtime/thread_enter.S runtime/gfx_bridge.c runtime/frontend.m runtime/account.c runtime/input.c runtime/hid_feedback.c runtime/motion_fusion.c runtime/autoload.c runtime/gamepad.m runtime/gamepad_feedback.m runtime/gfx_probe.c runtime/vpool_probe.m runtime/gpu_path_probe.m runtime/memory_probe.c runtime/shared_font.c runtime/ipc.c runtime/audio_renderer.c runtime/audio_mixer.c runtime/audio_reverb.c runtime/audio_effects.c runtime/fs_host.c runtime/opus_codec.c runtime/movie_host.c runtime/time_host.c runtime/applet_host.c runtime/swkbd_host.c $(GFX_OBJECTS_OOT) /opt/homebrew/opt/opus/lib/libopus.a /opt/homebrew/opt/libvpx/lib/libvpx.a -framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreText -framework UniformTypeIdentifiers -fobjc-arc -framework Cocoa -framework CoreVideo -framework CoreFoundation -framework AudioToolbox -framework GameController -framework CoreHaptics -framework IOKit -framework IOSurface -o "$@"
+runtime-oot binary-oot: SHADER_LIST ?= ../oot/assets/shader_list.tsv
+binary-oot: build/totk-native-oot build/pso_manifest.tsv build/pso_title.tsv
+runtime-oot: binary-oot game-data-oot
 # Production Opus-wrapper regression checks; no game assets or audio device needed.
 OPUS_TEST_WORK ?= /tmp/totk-native-opus-codec
 OPUS_PREFIX ?= /opt/homebrew/opt/opus

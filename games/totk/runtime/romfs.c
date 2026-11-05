@@ -44,7 +44,7 @@ static ssize_t src_pread(int fd,void *buf,size_t n,off_t off) {
  return pread(chunk_fds[c],buf,n,(off_t)o);
 }
 static const uint8_t *image_map;
-static char mount_name[32];
+static char mount_names[4][32]; static unsigned n_mount_names;   /* all names alias the one read-only image (see mount_rom) */
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t read_calls,read_bytes,read_ns,read_prepare_ns,read_report_ns;
 static uint64_t handles[NH]; /* file index + 1; 0 is free */
@@ -284,12 +284,36 @@ void runtime_fs_init(void) {
 }
 static int path_ok(const char *p) {return romfs_path_valid_relative(p);}
 static const char *rom_path(const char *path) {
- return romfs_path_relative(mount_name,path);
+ for(unsigned i=0;i<n_mount_names;i++){const char *r=romfs_path_relative(mount_names[i],path);if(r)return r;}
+ return NULL;
 }
 static uint64_t lower(const char *name) {uint64_t lo=0,hi=file_count;while(lo<hi){uint64_t m=lo+(hi-lo)/2;if(strcmp(entry_name(entry(m)),name)<0)lo=m+1;else hi=m;}return lo;}
+/* The index-th child of a RomFS directory: one path segment, its type (0 folder, 1 file) and, for a file, its size.
+   Children come from the sorted file paths (folders exist only as prefixes); added overlay files are not listed.
+   ponytail: re-scans from the binary-search point per call; keep a cursor per handle if listing ever gets hot. */
+unsigned runtime_romfs_child(const char *path,uint64_t index,char *name,size_t cap,int *type,int64_t *size) {
+ const char *p=rom_path(path);if(!p)return NOT_FOUND;size_t n=strlen(p);if(n>4094)return NOT_FOUND;
+ char prefix[4096];memcpy(prefix,p,n);prefix[n]='/';prefix[n+1]=0;
+ uint64_t i=lower(prefix),seen=0;char last[4096]="";
+ for(;i<file_count;i++){const char *nm=entry_name(entry(i));if(strncmp(nm,prefix,n+1))break;
+  const char *seg=nm+n+1; size_t slash_off=strchr(seg,'/')?(size_t)(strchr(seg,'/')-seg):strlen(seg);
+  if(slash_off>=cap||slash_off>=sizeof last)continue;
+  char child[4096];memcpy(child,seg,slash_off);child[slash_off]=0;
+  if(!strcmp(child,last))continue;   /* the same folder from several of its files */
+  strcpy(last,child);
+  if(seen++==index){strcpy(name,child);if(type)*type=strchr(seg,'/')?0:1;
+   if(size)*size=strchr(seg,'/')?0:(int64_t)entry(i).size;return 0;}}
+ return NOT_FOUND;
+}
 static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
- (void)cache;(void)size;runtime_fs_init();if(!name||!path_ok(name)||strlen(name)>=sizeof(mount_name)||strchr(name,'/')||strchr(name,':'))return INVALID;
- if(*mount_name&&strcmp(name,mount_name))runtime_fail("second RomFS mount not implemented");strcpy(mount_name,name);return 0;
+ (void)cache;(void)size;runtime_fs_init();if(!name||!path_ok(name)||strlen(name)>=sizeof mount_names[0]||strchr(name,'/')||strchr(name,':'))return INVALID;
+ /* The game may mount the same read-only image under more than one name (Ocarina of Time: a second name after "content").
+    Every name aliases the one image from this dump; a genuinely second volume would need a second image. */
+ for(unsigned i=0;i<n_mount_names;i++)if(!strcmp(name,mount_names[i]))return 0;
+ fprintf(stderr,"[totk] RomFS also mounted as \"%s\" cache=%llx size=%llx\n",name,(unsigned long long)(uintptr_t)cache,(unsigned long long)size);
+ if(n_mount_names==sizeof mount_names/sizeof mount_names[0])runtime_fail("too many RomFS mount names");
+ if(n_mount_names)fprintf(stderr,"[totk] RomFS also mounted as \"%s\" cache=%llx size=%llx\n",name,(unsigned long long)(uintptr_t)cache,(unsigned long long)size);
+ strcpy(mount_names[n_mount_names++],name);return 0;
 }
 static unsigned cache_size(uint64_t *out) {if(!out)return INVALID;*out=0;return 0;}
 /* SDK 20's forms (Pokemon Pokopia): MountRom without a cache, and with a program index (0: the application's own RomFS). */
@@ -335,7 +359,14 @@ unsigned runtime_romfs_entry_type(int *out,const char *path) {
  if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;if(file_index(p)!=UINT64_MAX){*out=1;return 0;}
  char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
 }
-int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
+int runtime_romfs_owns(const char *path) {for(unsigned i=0;i<n_mount_names;i++){size_t n=strlen(mount_names[i]);if(path&&!strncmp(path,mount_names[i],n)&&path[n]==':')return 1;}return 0;}
+/* Unmount by bare name (the game may mount and unmount optional data sets, like NPLN's "_npln"). */
+int runtime_romfs_unmount(const char *name) {
+ for(unsigned i=0;i<n_mount_names;i++)if(name&&!strcmp(name,mount_names[i])){
+  for(unsigned j=i;j+1<n_mount_names;j++)strcpy(mount_names[j],mount_names[j+1]);
+  n_mount_names--;return 1;}
+ return 0;
+}
 int runtime_romfs_handle(uint64_t h) {return h>0x100000000ULL&&h<0x100000000ULL+NH;}
 unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *buf,uint64_t size) {return runtime_romfs_read(out,h,off,buf,size);}
 void *runtime_fs_override(const char *name) {

@@ -228,6 +228,7 @@ static void scan_record(ucontext_t *u, uint64_t pc) {
         }
     }
 }
+static void scan_where(char *s, size_t n, uint64_t a);   /* defined below */
 int runtime_mem_scan_trap(void *context) {   /* loader.c crash(): 1 when this SIGTRAP was the scan watchpoint */
     ucontext_t *u = context; uint64_t w = atomic_load(&scan_watch_addr);
     unsigned ec = (unsigned)(u->uc_mcontext->__es.__esr >> 26); uint64_t far = u->uc_mcontext->__es.__far;
@@ -238,6 +239,12 @@ int runtime_mem_scan_trap(void *context) {   /* loader.c crash(): 1 when this SI
         uint64_t bp = atomic_load(&scan_bp_addr), pc0 = u->uc_mcontext->__ss.__pc;
         if (bp && pc0 == bp) {   /* the code breakpoint: record it like a watch hit, step over it with slot 1 */
             scan_record(u, pc0);
+            {   /* print the hit now: a breakpoint that leads to a crash would otherwise lose its window */
+                char where[64]; scan_where(where, sizeof where, pc0);
+                uint64_t lr = u->uc_mcontext->__ss.__lr;
+                scan_out("bp hit %s lr=%#llx", where, (unsigned long long)lr);
+                for (int r = 0; r < 8; r++) scan_out("  x%d=%#llx", r, (unsigned long long)u->uc_mcontext->__ss.__x[r]);
+            }
             thread_act_t self = mach_thread_self(); arm_debug_state64_t d; mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
             if (thread_get_state(self, ARM_DEBUG_STATE64, (thread_state_t)&d, &c) == KERN_SUCCESS) {
                 d.__bcr[2] = 0; d.__bvr[1] = (pc0 + 4) & ~3ULL; d.__bcr[1] = (0xfu << 5) | (2u << 1) | 1u;

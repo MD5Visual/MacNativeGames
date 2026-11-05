@@ -2,4 +2,5 @@
 cryptography==50.0.2   # decrypting the card image (NCA / XCI)
 lz4==4.4.5             # the code modules (NSO segments)
 capstone==5.0.9        # the code rewriter's disassembler
+zbic==1.0.1.post1      # Switch 2 ZBIC sections (NSO segments)
 nsz==5.0.0             # decompress update containers before NCA extraction
