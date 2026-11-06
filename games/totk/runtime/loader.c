@@ -272,6 +272,15 @@ static void export_ios_text(const char *rewritten,const char *out) {
   printf("%s text_bytes=%zu patched_words=%u patch_area_bytes=%zu patched_words=%u\n",m->name,n,diff,p1-p0,pdiff);}
 }
 #endif
+/* TEMP probe (OoT movie wall, findings §18): the game's MovieRenderer::Update copies the decoded frame into its
+   upload pool with one memcpy of w*h*3/2 (3.1 MB) through main's PLT stub. A CPU watchpoint on the pool saw zero
+   writes, yet static analysis says the copy runs. This interposes main's memcpy GOT slot: log the big copies
+   (dst/src/size) and tail-call the real one. Gated by TOTK_MEMCPY_WATCH=1; remove with the other probes. */
+static void *g_memcpy_real;
+static void *memcpy_watch(void *d,const void *s,unsigned long n) {
+ if(n==3110400||n==0) { static int cnt,nz; if(n==0){if(++nz<=6)fprintf(stderr,"[memcpy-watch] zero #%d dst=%p src=%p\n",nz,d,s);} else { cnt++; if(cnt<=4||cnt%150==0) { void *r=((void *(*)(void*,const void*,unsigned long))g_memcpy_real)(d,s,n); fprintf(stderr,"[memcpy-watch] MOVIE #%d dst=%p src=%p size=%lu src16=%02x%02x%02x%02x dst16=%02x%02x%02x%02x\n",cnt,d,s,n,((unsigned char*)s)[0],((unsigned char*)s)[1],((unsigned char*)s)[2],((unsigned char*)s)[3],((unsigned char*)d)[0],((unsigned char*)d)[1],((unsigned char*)d)[2],((unsigned char*)d)[3]); return r; } } }
+ return ((void *(*)(void*,const void*,unsigned long))g_memcpy_real)(d,s,n);
+}
 static void relocate(Module *m) {
  for(unsigned i=0;i<m->nreloc;i++) {
   const Reloc *r=&m->relocs[i];
@@ -287,6 +296,7 @@ static void relocate(Module *m) {
    if(!p&&s->binding!=2){fprintf(stderr,"%s unresolved %s\n",m->name,s->name);runtime_fail("strong import unresolved");}
    if(!p)m->weak++;
    if(p&&!s->defined)m->cross++;
+   if(p&&!strcmp(s->name,"memcpy")&&getenv("TOTK_MEMCPY_WATCH")&&g_memcpy_real==NULL) { g_memcpy_real=p; p=memcpy_watch; }
    v=(uintptr_t)p+(r->kind==1026?0:r->addend);m->symbolic++;
   }
   memcpy(m->base+r->where,&v,8);

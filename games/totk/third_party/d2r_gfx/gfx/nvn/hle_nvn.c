@@ -199,13 +199,32 @@ static const int g_devinfo[] = {
     [0x4E] = 1024, [0x4F] = 32, [0x50] = 4096, [0x51] = 65536, [0x52] = 65536, [0x53] = 256, [0x54] = 16384,
     [0x55] = 262144, [0x56] = 4096, [0x57] = 1, [0x58] = 4, [0x59] = 2, [0x5A] = 0, [0x5B] = 4096, [0x5C] = 16384,
     [0x5D] = 4096, [0x5E] = 128, [0x5F] = 4096,
+    /* NVN2 (Switch 2) items 0x60+ from nxnative's table read out of the game-side SDK 21.4.4 constants
+       (their g_devinfo2; DEVINFO_RT items - read from the GPU at run time there - stay unanswered).
+       0x67 is the shader-code copy alignment (256): Ocarina of Time's NDVE movie-shader parser reads it
+       and asserts on the 0 an unanswered item would give. */
+    [0x60] = 65535, [0x61] = 1, [0x63] = 256, [0x64] = 16, [0x65] = 65535, [0x66] = 65535, [0x67] = 256,
+    [0x68] = 1, [0x69] = 16, [0x6A] = 16, [0x6B] = 16, [0x6C] = 1, [0x6D] = 1, [0x6E] = 1, [0x6F] = 256,
+    [0x70] = 0, [0x71] = 16, [0x72] = 8, [0x73] = 16, [0x74] = 32, [0x75] = 31, [0x76] = 536870912,
+    [0x77] = 16777216, [0x78] = 16777216, [0x79] = 1073741824, [0x7A] = 32, [0x7B] = 1, [0x7C] = 64,
+    [0x7E] = 1, [0x7F] = 2147483647, [0x80] = 32, [0x81] = 32, [0x82] = 4194303, [0x83] = 512, [0x84] = 256,
+    [0x85] = 32, [0x86] = 16383, [0x88] = 8, [0x89] = 0, [0x8A] = 0, [0x8B] = 4, [0x8C] = 256, [0x8D] = 16,
+    [0x8E] = 0, [0x8F] = 1, [0x90] = 31, [0x91] = 0, [0x92] = 64, [0x93] = 1, [0x94] = 58368, [0x95] = 24576,
+    [0x96] = 0, [0x97] = 256, [0x98] = 262144, [0x9B] = 0, [0x9C] = 201, [0x9D] = 14, [0x9E] = 201,
+    [0x9F] = 20, [0xA0] = 163840, [0xA1] = 8, [0xA2] = 4, [0xA3] = 256, [0xA4] = 256, [0xA5] = 4,
+    [0xA6] = 65536, [0xA7] = 201, [0xA8] = 5, [0xA9] = 1,
 };
 NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out) {
     (void)d;
     unsigned w = (unsigned)what;
     // 0x5F 分离采样器绑定数、0x60/0x61 在 SMO 实测表里没有：0x5F 按采样器池上限给 4096 未核，0x60/0x61 报红给 0
     // 0x5F separate sampler binding count and 0x60/0x61 are not in the table measured on SMO: 0x5F is given 4096 per the sampler pool limit, unverified; 0x60/0x61 report a failure and return 0
-    if (w >= sizeof g_devinfo / sizeof *g_devinfo) { die("unsupported NVN device property %#x", w); }
+    if (w >= sizeof g_devinfo / sizeof *g_devinfo) {   // NVN2 (Switch 2) added properties past this Switch 1 table: answer 0 (feature absent), never end the game
+        static unsigned once[4]; int dup = 0;
+        for (int i = 0; i < 4; i++) if (once[i] == w) dup = 1;
+        if (!dup) { for (int i = 0; i < 4; i++) if (!once[i]) { once[i] = w; break; }
+            fprintf(stderr, "[totk-gfx] [RED] NVN device property %#x is not in the measured table, answering 0\n", w); }
+        *out = 0; OLOG("DeviceGetInteger %#x -> 0 (unknown)", w); return; }
     *out = g_devinfo[w];
     OLOG("DeviceGetInteger %#x -> %d", w, *out);
 }
@@ -607,6 +626,47 @@ NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureVie
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
 NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+
+// ---------- 原生图像 ----------
+// ---------- Native images ----------
+// 解码出的视频画面变成贴图（nn::codec 的池 → NativeImageHandle → nvnNativeImage → nvnTextureInitializeFromNativeImage，OoT 的片头/标题视频，RGBA8）。这些名字不在过程表里：SDK 的影片库按 mangled 名直接导入。句柄来自 nn::codec 的池（ns2_codec.c 的 dm_native_image），它把画面按 RGBA 写进游戏的池内存；一条覆盖这段内存的线性贴图无需上传就能读到每一帧。
+// A decoded video picture as a texture (nn::codec's pool → NativeImageHandle → nvnNativeImage → nvnTextureInitializeFromNativeImage; OoT's movie and title background, RGBA8). These names are not in the proc table: the SDK's movie library imports them directly. The handle comes from nn::codec's pool (dm_native_image in ns2_codec.c), which keeps each picture as RGBA in the game's pool memory; a linear texture over that memory reads each new picture with no upload.
+__attribute__((weak)) int dm_native_image(uint32_t handle, uint8_t **mem, uint64_t *size, uint32_t *w, uint32_t *h, uint32_t *stride) { (void)handle; (void)mem; (void)size; (void)w; (void)h; (void)stride; return 0; }   // ns2_codec.c; graphics unit tests have no decoder
+typedef struct { NVNdevice *dev; uint32_t handle; NVNformat format; int perm; } native_builder_t;   // 游戏给 builder 0x100 字节 | the game gives the builder 0x100 bytes
+typedef struct { NVNdevice *dev; uint32_t handle; NVNformat format; uint32_t has_pool; NVNmemoryPool pool; } native_image_t;   // 图像 0x200 | and the image 0x200
+_Static_assert(sizeof(native_image_t) <= 0x200, "the game's NVNnativeImage");
+HLE_FORCE("_Z32nvnNativeImageBuilderSetDefaultsP21NVNnativeImageBuilder", "native images are the host's", void, h_ni_defaults, native_builder_t *b) { NVNdevice *d = b->dev; memset(b, 0, sizeof *b); b->dev = d; }
+HLE_FORCE("_Z30nvnNativeImageBuilderSetDeviceP21NVNnativeImageBuilderP9NVNdevice", "native images are the host's", void, h_ni_device, native_builder_t *b, NVNdevice *d) { b->dev = d; }
+HLE_FORCE("_Z41nvnNativeImageBuilderSetNativeImageHandleP21NVNnativeImageBuilderN2nn2gs17NativeImageHandleE", "native images are the host's", void, h_ni_handle, native_builder_t *b, uint32_t h) { b->handle = h; }
+HLE_FORCE("_Z40nvnNativeImageBuilderSetMemoryPermissionP21NVNnativeImageBuilder30NVNnativeImageMemoryPermission", "native images are the host's: the permission has no meaning there", void, h_ni_perm, native_builder_t *b, int p) { b->perm = p; }
+HLE_FORCE("_Z30nvnNativeImageBuilderSetFormatP21NVNnativeImageBuilder9NVNformat", "native images are the host's", void, h_ni_format, native_builder_t *b, NVNformat f) { b->format = f; }
+HLE_FORCE("_Z30nvnNativeImageBuilderGetDevicePK21NVNnativeImageBuilder", "native images are the host's", NVNdevice *, h_ni_get_device, const native_builder_t *b) { return b->dev; }
+HLE_FORCE("_Z41nvnNativeImageBuilderGetNativeImageHandlePK21NVNnativeImageBuilder", "native images are the host's", uint32_t, h_ni_get_handle, const native_builder_t *b) { return b->handle; }
+HLE_FORCE("_Z40nvnNativeImageBuilderGetMemoryPermissionPK21NVNnativeImageBuilder", "native images are the host's", int, h_ni_get_perm, const native_builder_t *b) { return b->perm; }
+HLE_FORCE("_Z30nvnNativeImageBuilderGetFormatPK21NVNnativeImageBuilder", "native images are the host's", NVNformat, h_ni_get_format, const native_builder_t *b) { return b->format; }
+HLE_FORCE("_Z24nvnNativeImageInitializeP14NVNnativeImagePK21NVNnativeImageBuilder", "native images are the host's", NVNboolean, h_ni_init, native_image_t *i, const native_builder_t *b) {
+    i->dev = b->dev; i->handle = b->handle; i->format = b->format; i->has_pool = 0;
+    OLOG("NativeImage handle %#x format %#x", b->handle, b->format);
+    return 1;
+}
+HLE_FORCE("_Z22nvnNativeImageFinalizeP14NVNnativeImage", "native images are the host's", void, h_ni_fini, native_image_t *i) {
+    if (i->has_pool) h_nvnMemoryPoolFinalize(&i->pool);
+    i->has_pool = 0;
+}
+HLE_FORCE("_Z35nvnTextureInitializeFromNativeImageP10NVNtextureP14NVNnativeImage", "a linear texture over the picture's memory", NVNboolean, h_ni_texture, NVNtexture *t, native_image_t *i) {
+    uint8_t *mem; uint64_t size; uint32_t w, h, stride;
+    if (!dm_native_image(i->handle, &mem, &size, &w, &h, &stride)) { LOG("[RED] nvnTextureInitializeFromNativeImage: handle %#x names no picture", i->handle); return 0; }
+    if (!i->has_pool) {   // 池只建一次：同一张原生图像的贴图反复重建 | the pool is made once; the game re-creates the texture on it
+        NVNmemoryPoolBuilder pb; h_nvnMemoryPoolBuilderSetDefaults(&pb); h_nvnMemoryPoolBuilderSetDevice(&pb, i->dev); h_nvnMemoryPoolBuilderSetStorage(&pb, mem, size);
+        h_nvnMemoryPoolBuilderSetFlags(&pb, NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
+        if (!h_nvnMemoryPoolInitialize(&i->pool, &pb)) return 0;
+        i->has_pool = 1;
+    }
+    NVNtextureBuilder tb; h_nvnTextureBuilderSetDefaults(&tb); h_nvnTextureBuilderSetDevice(&tb, i->dev);
+    h_nvnTextureBuilderSetTarget(&tb, NVN_TEXTURE_TARGET_2D); h_nvnTextureBuilderSetFormat(&tb, i->format); h_nvnTextureBuilderSetSize2D(&tb, (int)w, (int)h); h_nvnTextureBuilderSetLevels(&tb, 1);
+    h_nvnTextureBuilderSetFlags(&tb, NVN_TEXTURE_FLAGS_LINEAR); h_nvnTextureBuilderSetStride(&tb, (ptrdiff_t)stride); h_nvnTextureBuilderSetStorage(&tb, &i->pool, 0);
+    return h_nvnTextureInitialize(t, &tb);
+}
 
 // ---------- 采样器 ----------
 // ---------- Samplers ----------
@@ -2365,6 +2425,7 @@ NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerP
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
     p_copy_b2t *o = REC(c, OP_COPY_B2T, p_copy_b2t); o->src = src; o->tex = tex_pin(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
+    { static int n; void *ra = __builtin_return_address(0), *rb = __builtin_return_address(1); if (n < 3 && r && r->width >= 960) { n++; LOG("TEMP: b2t record #%d src=%#llx %dx%d caller=%p f1=%p", n, (unsigned long long)src, r->width, r->height, ra, rb); } }   /* TEMP probe (OoT) */
 }
 NVN(nvnCommandBufferCopyTextureToBuffer, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r,
     NVNbufferAddress dst, int flags) {

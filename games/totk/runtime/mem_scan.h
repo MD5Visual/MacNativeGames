@@ -164,6 +164,7 @@ static void scan_show(size_t limit) {
 
 /* The watchpoint: the same mechanism as 1.4.3's frmwatch (game_patches_v143.c), for any address, write or read/write. */
 static _Atomic uint64_t scan_watch_addr; static int scan_watch_rw; static _Atomic int scan_stepping; static _Atomic uint64_t scan_bp_addr;
+#define SCAN_BCR (0x2005u)   /* AArch64 execute match: AAT(bit13)|ENABLE(bit2)|EL0(bit0) - bcr=1 alone never fires */
 enum { SCAN_SLOTS = 256 };
 enum { SCAN_CHAIN = 10 };
 static struct { _Atomic uint64_t pc; _Atomic uint64_t lr; _Atomic uint32_t n; _Atomic int filled; uint64_t x[31], sp, chain[SCAN_CHAIN]; float v[16]; } scan_hits[SCAN_SLOTS];
@@ -176,7 +177,7 @@ static void scan_watch_set(thread_act_t t, uint64_t addr) {
     d.__wcr[1] = watch ? ((0xfULL << ((addr & 7) + 5)) | ((scan_watch_rw ? 3u : 2u) << 3) | (2u << 1) | 1u) : 0;
     if (!addr) { d.__bvr[1] = 0; d.__bcr[1] = 0; }   /* the step breakpoint (scan_step) goes with the watch */
     uint64_t bp = atomic_load(&scan_bp_addr);
-    d.__bvr[2] = bp ? (bp & ~3ULL) : 0; d.__bcr[2] = bp ? ((0xfu << 5) | (2u << 1) | 1u) : 0;
+    d.__bvr[2] = bp ? (bp & ~3ULL) : 0; d.__bcr[2] = bp ? SCAN_BCR : 0;   /* execute match: AAT|ENABLE|EL0 */
     thread_set_state(t, ARM_DEBUG_STATE64, (thread_state_t)&d, ARM_DEBUG_STATE64_COUNT);
 }
 /* After a hit the watch is off on that thread and a breakpoint sits on the next instruction (the access itself is no
@@ -185,12 +186,12 @@ static void scan_step(uint64_t next_pc, uint64_t watch) {
     thread_act_t self = mach_thread_self();
     arm_debug_state64_t d; mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
     if (thread_get_state(self, ARM_DEBUG_STATE64, (thread_state_t)&d, &c) == KERN_SUCCESS) {
-        if (next_pc) { d.__wcr[1] = 0; d.__bvr[1] = next_pc & ~3ULL; d.__bcr[1] = (0xfu << 5) | (2u << 1) | 1u; }
+        if (next_pc) { d.__wcr[1] = 0; d.__bvr[1] = next_pc & ~3ULL; d.__bcr[1] = SCAN_BCR; }   /* step-over: execute match */
         else {
             d.__bvr[1] = 0; d.__bcr[1] = 0;
             if (watch) { d.__wvr[1] = watch & ~7ULL; d.__wcr[1] = (0xfULL << ((watch & 7) + 5)) | ((scan_watch_rw ? 3u : 2u) << 3) | (2u << 1) | 1u; }
             uint64_t bp = atomic_load(&scan_bp_addr);
-            if (bp) { d.__bvr[2] = bp & ~3ULL; d.__bcr[2] = (0xfu << 5) | (2u << 1) | 1u; }
+            if (bp) { d.__bvr[2] = bp & ~3ULL; d.__bcr[2] = SCAN_BCR; }
         }
         thread_set_state(self, ARM_DEBUG_STATE64, (thread_state_t)&d, ARM_DEBUG_STATE64_COUNT);
     }
@@ -247,7 +248,7 @@ int runtime_mem_scan_trap(void *context) {   /* loader.c crash(): 1 when this SI
             }
             thread_act_t self = mach_thread_self(); arm_debug_state64_t d; mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
             if (thread_get_state(self, ARM_DEBUG_STATE64, (thread_state_t)&d, &c) == KERN_SUCCESS) {
-                d.__bcr[2] = 0; d.__bvr[1] = (pc0 + 4) & ~3ULL; d.__bcr[1] = (0xfu << 5) | (2u << 1) | 1u;
+                d.__bcr[2] = 0; d.__bvr[1] = (pc0 + 4) & ~3ULL; d.__bcr[1] = SCAN_BCR;
                 thread_set_state(self, ARM_DEBUG_STATE64, (thread_state_t)&d, ARM_DEBUG_STATE64_COUNT);
             }
             mach_port_deallocate(mach_task_self(), self); return 1;

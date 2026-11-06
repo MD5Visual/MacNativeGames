@@ -951,6 +951,43 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 
+/* TEMP probe (OoT): dump the frame object's gate + job-pipeline state. Called at barrier-wait entry AND by the
+   park watchdog (a wait that never returned within 10 s = the permanent park). */
+static uint64_t park_obj, park_addr; static double park_deadline; static int park_dumped;
+static void gate_dump(uint64_t obj, uint8_t *mb, uint64_t addr) {
+    if (!mb || obj < 0x1000) return;
+    #define MO2(a) ((a) >= (uintptr_t)mb && (a) < (uintptr_t)mb + 0x8700000 ? (unsigned long long)((a) - (uintptr_t)mb) : 0ull)
+    struct timespec dts; clock_gettime(CLOCK_MONOTONIC, &dts);
+    fprintf(stderr, "[wait-probe] PARK frame-obj %llx t=%.1fs: a0=%x 248=%x ab=%llx 50=%x 88=%x 188=%llx(m+%llx)\n",
+        (unsigned long long)obj, dts.tv_sec + dts.tv_nsec / 1e9,
+        (unsigned)(int32_t)gread64(obj + 0xa0), (unsigned)gread64(obj + 0x248), (unsigned long long)(gread64(obj + 0xa8) >> 24 & 0xff),
+        (unsigned)gread64(obj + 0x50), (unsigned)gread64(obj + 0x88),
+        (unsigned long long)gread64(obj + 0x188), MO2(gread64(obj + 0x188)));
+    uint64_t pl = gread64(obj + 0x38);
+    if (pl > 0x1000) {
+        uint64_t node = gread64(pl + 0x40), pay = node > 0x1000 ? gread64(node + 0x10) : 0;
+        uint64_t pool = gread64(pl + 0xf0);
+        fprintf(stderr, "[wait-probe]   PARK pipeline=%llx head=%llx node=%llx payload=%llx jobstate=%x slotcnt=%d\n",
+            (unsigned long long)pl, (unsigned long long)gread64(pl + 0x38), (unsigned long long)node, (unsigned long long)pay,
+            pay > 0x1000 ? (unsigned)(gread64(pay + 0xb0) & 0xff) : 0xffff, pool > 0x1000 ? (int)(int32_t)gread64(pool + 0x10) : -1);
+        uint64_t sched = gread64(pl + 0x28);
+        for (int i = 0; i < 8; i++) { uint64_t w = sched > 0x1000 ? gread64(sched + 8 * (unsigned)i) : 0;
+            if (w < 0x1000 || w == ~0ull) break;
+            fprintf(stderr, "[wait-probe]   PARK worker%d=%llx state=%x\n", i, (unsigned long long)w, (unsigned)(gread64(w + 0xac) & 0xff)); }
+    }
+    fprintf(stderr, "[wait-probe]   PARK barrier addr=%llx frame=%llx frame_b0=%x frame_200=%llx frame_e8=%x\n", (unsigned long long)addr,
+        (unsigned long long)(addr - 0x1e8), (unsigned)(gread64(addr - 0x1e8 + 0xb0) & 0xff),
+        (unsigned long long)gread64(addr - 0x1e8 + 0x200), (unsigned)(gread64(addr - 0x1e8 + 0xe8) & 0xff));
+}
+
+void runtime_park_check(void);   /* TEMP probe (OoT): called from the input poll thread too (no guest svc needed) */
+void runtime_park_check(void) {
+    if (!park_deadline || park_dumped) return;
+    struct timespec pts; clock_gettime(CLOCK_MONOTONIC, &pts);
+    if (pts.tv_sec + pts.tv_nsec / 1e9 > park_deadline) {
+        park_dumped = 1; gate_dump(park_obj, runtime_module_base("main"), park_addr); }
+}
+
 int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
 
@@ -1106,6 +1143,9 @@ int svc_thread(int num, uint64_t *regs) {
 
     case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等、3 64 位相等则等（Switch 2 SDK） | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less then wait, 2 wait if equal, 3 wait if equal (64-bit, Switch 2 SDK; Lichii #87 found Ocarina needs it)
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
+        {   /* TEMP probe (OoT): if main's armed barrier wait is still pending 10 s later, this svc call (any thread)
+               means the game is parked forever - dump the pipeline state at the park. */
+            runtime_park_check(); }
         pthread_mutex_lock(&G);
         int64_t r; uint32_t v = 0; int ok;
         if (type == 3) ok = ld64(addr) == regs[2];
@@ -1119,20 +1159,47 @@ int svc_thread(int num, uint64_t *regs) {
                 fprintf(stderr, "[wait-probe] th=%u timed-wait addr=%llx type=%d timeout=%lld\n", t->handle, (unsigned long long)addr, type, (long long)(int64_t)regs[3]); }
             /* TEMP probe (OoT boot): infinite address waits are the real blockers; the mutex word names its holder. */
             struct wseen { uint64_t a; uint32_t h; }; static struct wseen seen[64]; static int nseen;
-            /* TEMP probe (OoT): dump the render pass (main+0x40cd20) gate fields live, at steady state. */
-            static int main_waits;
-            if (t->handle == 0x1001 && ++main_waits == 300 && getenv("TOTK_WAIT_LOG")) {
+            /* TEMP probe (OoT): dump the frame object's gate fields at the steady-state wait. The frame-gate function
+               (main+0x2cabd0) saves the frame fn's link 0x346c73c and x19 = frame object 0x10 above it. Only fire when
+               the stack also holds the present-path return (0x68fde0/0x68fd14 = the WaitLightEvent bl on frame+0x1e8,
+               0x68fb7c = its caller) - that is the stalled barrier wait itself, no time gate needed. */
+            static int gate_n;   /* TEMP probe: count marker-matched waits; every one arms the park watchdog */
+            if (t->handle == 0x1001 && (int64_t)regs[3] < 0 && getenv("TOTK_WAIT_LOG")) {   /* TEMP probe: no cap — the real park is the last dump */
                 uint8_t *mb = runtime_module_base("main");
+                #define MO(a) ((a) >= (uintptr_t)mb && (a) < (uintptr_t)mb + 0x8700000 ? (unsigned long long)((a) - (uintptr_t)mb) : 0ull)
                 uint64_t sp0 = regs[29] - 0x100;
-                for (unsigned k = 0; k < 1024; k++) { uint64_t v = 0; vm_size_t got = 0;
+                long kf = -1; int koff = 0, present = 0; vm_size_t got = 0;
+                for (unsigned k = 0; k < 1024; k++) { uint64_t v = 0;
                     if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + k * 8), 8, (vm_address_t)&v, &got) != KERN_SUCCESS) break;
-                    if (mb && v == (uint64_t)(mb + 0x346c73c)) {   /* frame fn's return address: [slot+0x10] = saved x19 */
-                        uint64_t obj = 0;
-                        if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + k * 8 + 0x10), 8, (vm_address_t)&obj, &got) == KERN_SUCCESS) {
-
-                            #define MO(a) ((a) >= (uintptr_t)mb && (a) < (uintptr_t)mb + 0x8700000 ? (unsigned long long)((a) - (uintptr_t)mb) : 0ull)
-                            fprintf(stderr, "[wait-probe] frame-obj %llx: 24f=%llx 248=%x ab=%llx 50=%x 88=%x 24d=%llx 188=%llx(m+%llx) 180=%llx\n",
-                                (unsigned long long)obj, gread64(obj + 0x248) >> 8 & 0xff, (unsigned)gread64(obj + 0x248), (unsigned long long)(gread64(obj + 0xa8) >> 24 & 0xff),
+                    if (!mb) break;
+                    if (v == (uint64_t)(mb + 0x68fde0) || v == (uint64_t)(mb + 0x68fd14) || v == (uint64_t)(mb + 0x68fb7c)
+                        || v == (uint64_t)(mb + 0x6e7318)          /* vsync-event wait (boot59 park) */
+                        || v == (uint64_t)(mb + 0x50c84) || v == (uint64_t)(mb + 0x50bfc)) present = 1;   /* submit-loop barrier wait (boot60 park) */
+                    if (v == (uint64_t)(mb + 0x346c73c)) { kf = (long)k; koff = 0x10; break; }   /* gate frame's link: x19 just above */
+                    if (v == (uint64_t)(mb + 0x346c78c)) { kf = (long)k; koff = 0x28; break; } }  /* render pass frame's link */
+                if (kf < 0 && !gate_n) {   /* TEMP probe: report why the dump never happened */
+                    static int miss; if (!miss++) {
+                        fprintf(stderr, "[wait-probe] gate-scan miss th=%u fp=%llx addr=%llx timeout=%lld\n", t->handle,
+                            (unsigned long long)regs[29], (unsigned long long)addr, (long long)(int64_t)regs[3]);
+                        for (unsigned k = 0; k < 8; k++) { uint64_t v = 0;
+                            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + k * 8), 8, (vm_address_t)&v, &got) != KERN_SUCCESS) break;
+                            fprintf(stderr, "[wait-probe]   fp+%x %llx(m+%llx)\n", k * 8 - 0x100, (unsigned long long)v, MO(v)); } } }
+                if (kf >= 0 && present) {
+                    gate_n++;
+                    uint64_t obj = 0;
+                    if (vm_read_overwrite(mach_task_self(), (vm_address_t)(sp0 + kf * 8 + koff), 8, (vm_address_t)&obj, &got) == KERN_SUCCESS && obj > 0x1000) {
+                        { struct timespec ats; clock_gettime(CLOCK_MONOTONIC, &ats);   /* TEMP probe: arm the park watchdog */
+                          fprintf(stderr, "[wait-probe] watchdog armed n=%d obj=%llx addr=%llx\n", gate_n, (unsigned long long)obj, (unsigned long long)addr);
+                          park_obj = obj; park_addr = addr; park_deadline = ats.tv_sec + ats.tv_nsec / 1e9 + 10; park_dumped = 0; }
+                        uint64_t pl0 = gread64(obj + 0x38);
+                        int hot = 0;
+                        if (pl0 > 0x1000) { uint64_t pool0 = gread64(pl0 + 0xf0);
+                            hot = gread64(pl0 + 0x40) != gread64(pl0 + 0x38) || (pool0 > 0x1000 && (int32_t)gread64(pool0 + 0x10) != 0); }
+                        if (gate_n <= 20) {   /* TEMP probe: dump every match; correlate with presents by the timestamp */
+                            struct timespec dts; clock_gettime(CLOCK_MONOTONIC, &dts);
+                            fprintf(stderr, "[wait-probe] frame-obj %llx t=%.1fs n=%d hot=%d: a0=%x 24f=%llx 248=%x ab=%llx 50=%x 88=%x 24d=%llx 188=%llx(m+%llx) 180=%llx\n",
+                                (unsigned long long)obj, dts.tv_sec + dts.tv_nsec / 1e9, gate_n, hot,
+                                (unsigned)(int32_t)gread64(obj + 0xa0), gread64(obj + 0x248) >> 8 & 0xff, (unsigned)gread64(obj + 0x248), (unsigned long long)(gread64(obj + 0xa8) >> 24 & 0xff),
                                 (unsigned)gread64(obj + 0x50), (unsigned)gread64(obj + 0x88), (unsigned long long)(gread64(obj + 0x248) >> 32 & 0xff),
                                 (unsigned long long)gread64(obj + 0x188), MO(gread64(obj + 0x188)), (unsigned long long)gread64(obj + 0x180));
                             uint64_t s = gread64((uint64_t)(mb + 0x4e7f6c8));
@@ -1140,8 +1207,26 @@ int svc_thread(int num, uint64_t *regs) {
                                 (unsigned long long)gread64((uint64_t)(mb + 0x4d48f0)), MO(gread64((uint64_t)(mb + 0x4d48f0))),
                                 (unsigned long long)gread64((uint64_t)(mb + 0x4d4950)), MO(gread64((uint64_t)(mb + 0x4d4950))),
                                 (unsigned long long)s, s != ~0ull ? (unsigned)(gread64(s + 0x164) & 0xffffffff) : 0, s != ~0ull ? (unsigned)(int32_t)gread64(s + 0x168) : 0);
+                            /* the job pipeline (gate x20 = [obj+0x38]): pending list head +0x38/first node +0x40, payload
+                               [node+0x10] with state [payload+0xb0] (1 queued 2 done 4 free); slot count [[pl+0xf0]+0x10];
+                               scheduler [pl+0x28] with worker array [sched+8*i], state [worker+0xac] (3/4 = asleep-ready). */
+                            uint64_t pl = gread64(obj + 0x38);
+                            if (pl > 0x1000) {
+                                uint64_t node = gread64(pl + 0x40), pay = node > 0x1000 ? gread64(node + 0x10) : 0;
+                                uint64_t pool = gread64(pl + 0xf0);
+                                fprintf(stderr, "[wait-probe]   pipeline=%llx head=%llx node=%llx payload=%llx jobstate=%x slotcnt=%d\n",
+                                    (unsigned long long)pl, (unsigned long long)gread64(pl + 0x38), (unsigned long long)node, (unsigned long long)pay,
+                                    pay > 0x1000 ? (unsigned)(gread64(pay + 0xb0) & 0xff) : 0xffff, pool > 0x1000 ? (int)(int32_t)gread64(pool + 0x10) : -1);
+                                uint64_t sched = gread64(pl + 0x28);
+                                for (int i = 0; i < 8; i++) { uint64_t w = sched > 0x1000 ? gread64(sched + 8 * (unsigned)i) : 0;
+                                    if (w < 0x1000 || w == ~0ull) break;
+                                    fprintf(stderr, "[wait-probe]   worker%d=%llx state=%x\n", i, (unsigned long long)w, (unsigned)(gread64(w + 0xac) & 0xff)); }
+                            }
+                            fprintf(stderr, "[wait-probe]   barrier addr=%llx frame=%llx frame_b0=%x frame_200=%llx frame_e8=%x\n", (unsigned long long)addr,
+                                (unsigned long long)(addr - 0x1e8), (unsigned)(gread64(addr - 0x1e8 + 0xb0) & 0xff),
+                                (unsigned long long)gread64(addr - 0x1e8 + 0x200), (unsigned)(gread64(addr - 0x1e8 + 0xe8) & 0xff));
                         }
-                        break; } } }
+                        } } }
             if ((int64_t)regs[3] < 0 && getenv("TOTK_WAIT_LOG")) {
                 int dup = 0; for (int i = 0; i < nseen; i++) if (seen[i].a == addr && seen[i].h == t->handle) dup = 1;
                 if (!dup && nseen < 64) { seen[nseen++] = (struct wseen){addr, t->handle};
@@ -1154,7 +1239,8 @@ int svc_thread(int num, uint64_t *regs) {
                             if (v >= (uintptr_t)b && v < (uintptr_t)b + sz[i]) { fprintf(stderr, "[wait-probe]   +%x %s+%llx\n", k * 8, nm[i], (unsigned long long)(v - (uintptr_t)b)); shown++; break; } } }
                 }
             }
-            r = block(t, 3, (int64_t)regs[3]); }
+            r = block(t, 3, (int64_t)regs[3]);
+            if (t->handle == 0x1001) park_deadline = 0; }   /* TEMP probe: the wait returned - not a park */
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }

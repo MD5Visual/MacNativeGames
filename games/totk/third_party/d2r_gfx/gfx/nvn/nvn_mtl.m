@@ -3340,22 +3340,22 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     if (tex_swizzle(t, t->d.format, &sw) && !(d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) d.swizzle = sw;
     return d;
 }
-// 就地升级：原贴图没开 PixelFormatView（缺省不开，保住苹果显卡无损压缩）却要建换格式视图时，按原规格 + PixelFormatView 新建、逐 slice × level 拷过去并替换登记。
+// 就地升级：原贴图没开某种用途（PixelFormatView 缺省不开，保住苹果显卡无损压缩；ShaderWrite 只在声明 IMAGE 用途时开）而后来需要它时，按原规格 + 该用途新建、逐 slice × level 拷过去并替换登记。
 // 计数：选角 / 营地 / 野外 / 战斗 4 页 17473 张贴图换格式视图 0 次，所以这里是兜底，不靠预测哪些贴图需要
-// In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
+// In-place upgrade: when the original texture was not created with a usage it later needs (PixelFormatView is off by default to keep Apple GPU lossless compression; ShaderWrite only when the IMAGE flag was declared), create a new one with the original spec + that usage, copy over every slice × level, and replace the registration.
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
-static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) {
+static id<MTLTexture> tex_upgrade_usage(const tex_t *t, id<MTLTexture> base, MTLTextureUsage add) {
     if (g_tex_preparing && rp_active()) { g_tex_prepare_split = 1; return base; }
     { stor_key k;   // TOTK: a storage-shared base is recreated for every serial holding it, then this serial re-resolves
-      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | MTLTextureUsagePixelFormatView)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
+      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | add)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // 保留原格式，只加换格式视图用途 | Keep the original format, only add the format-view usage
     d.swizzle=base.swizzle;
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
-    d.resourceOptions = base.resourceOptions; d.usage = base.usage | MTLTextureUsagePixelFormatView;
+    d.resourceOptions = base.resourceOptions; d.usage = base.usage | add;
     id<MTLTexture> upgraded = [g_dev newTextureWithDescriptor:d];
-    if (!upgraded) { RED_ONCE(45, "贴图升级失败 ser=%llu 格式 %lu → %lu", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf); return base; }
+    if (!upgraded) { RED_ONCE(45, "贴图升级用途 +%#lx 失败 ser=%llu 格式 %lu", (unsigned long)add, t->serial, (unsigned long)base.pixelFormat); return base; }
     res_add(upgraded);
     id<MTL4ComputeCommandEncoder> b = blit();
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
@@ -3369,7 +3369,7 @@ static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPi
     id holder = serial_get(t->serial);
     if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; memset(&((NvPkg *)holder)->key, 0, sizeof(reup_key)); defer_obj_release(old); ser_bump(t->serial); }   // key 0: the upgraded texture is not recycled
     else serial_put(t->serial, upgraded);
-    MLOG("贴图升级为可换格式视图 ser=%llu 基格式 %lu → 视图格式 %lu（升级次数=%llu）", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    MLOG("贴图升级用途 +%#lx ser=%llu 格式 %lu（升级次数=%llu）", (unsigned long)add, t->serial, (unsigned long)base.pixelFormat, ++g_pfv_upgrades);
     return upgraded;
 }
 static int stor_key_lookup(id o, stor_key *k) {
@@ -5051,7 +5051,7 @@ static id<MTLTexture> attachment_texture(const tex_t *t, const view_t *v, int ha
     MTLPixelFormat bpf = b0.pixelFormat, pf = attachment_format(t, v, has_v, bpf);
     if (pf == bpf) return b0;
     id<MTLTexture> base = b0;
-    if (tex_need_pfv(base.pixelFormat, pf) && !(base.usage & MTLTextureUsagePixelFormatView)) base = tex_upgrade_pfv(t, base, pf);
+    if (tex_need_pfv(base.pixelFormat, pf) && !(base.usage & MTLTextureUsagePixelFormatView)) base = tex_upgrade_usage(t, base, MTLTextureUsagePixelFormatView);
     /* Bounded cache: views retain their base. Evictions remain resident until their last submit finishes. */
     static id<MTLTexture> views[32]; static unsigned next;
     for (unsigned i = 0; i < 32; i++) if (views[i].parentTexture == base && views[i].pixelFormat == pf) return views[i];
@@ -5899,8 +5899,8 @@ void mtl_variant_stats(uint64_t *n, uint64_t *ns, uint64_t *pre, uint64_t *bg, u
 static int drv_fillable(int stage, int bank, unsigned off) {
     if (bank == 2) return (off >= 0x20 && off < 0x120) || (off >= 0x168 && off < 0x968);
     switch (stage) {
-    case 0: return (off >= 0x110 && off < 0x210) || off == 0x610;
-    case 1: return off >= 0x510 && off < 0x610;
+    case 0: return (off >= 0x110 && off < 0x210) || off == 0x610 || (off >= 0x640 && off < 0x650);
+    case 1: return (off >= 0x510 && off < 0x610) || (off >= 0x640 && off < 0x650);
     case 5: return off >= 0x200 && off < 0x410;
     default: return 0;
     }
@@ -6367,6 +6367,14 @@ typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view
 /* TOTK: view_tt / view_parent: textureType and parentTexture of view, read once when it is stored (a Metal texture never
    changes either). view_parent is only compared, never messaged; the view retains its parent while it is stored. */
 static treg_t *g_treg; static int g_ntreg;
+/* NVN lets a texture be bound as an image without declaring NVN_TEXTURE_FLAGS_IMAGE (OoT's movie library binds its NDVE output that way); the real driver makes it writable.
+   Add ShaderWrite to the host texture once. At bind replay the encoder is usually still closed; at argument resolution the copy opens its own encoder and the dispatch follows behind it (see TOTK_DISP_PREARGS). */
+static void tex_ensure_writable(int tid) {
+    if (!tid || tid >= g_ntreg) return;
+    tex_t *tx = &g_treg[tid].t; if (!tx->serial) return;
+    id<MTLTexture> bt = tex_mtl(tx);
+    if (bt && !(bt.usage & MTLTextureUsageShaderWrite)) tex_upgrade_usage(tx, bt, MTLTextureUsageShaderWrite);
+}
 /* Only slots with a cached Metal view need work when an NVN texture is finalized. A linear
    scan of the entire descriptor pool on every finalize dominated the game's render thread. */
 static nvn_hmap g_view_heads = {.klen = 8};   // serial -> slot id + 1; protected by g_rmu
@@ -6733,13 +6741,13 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
             pf = base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLPixelFormatX32_Stencil8 : base.pixelFormat == MTLPixelFormatStencil8 ? MTLPixelFormatStencil8 :
                  (uint32_t)MTLPixelFormatInvalid;
             if (pf == MTLPixelFormatInvalid) { RED_ONCE(101, "stencil view of a texture in Metal format %lu with no stencil plane: depth sampled", (unsigned long)base.pixelFormat); pf = (uint32_t)base.pixelFormat; }
-            else if (pf != base.pixelFormat && !(base.usage & MTLTextureUsagePixelFormatView)) { base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf); if (g_tex_prepare_split) return NULL; sg = g_ser_gen; }
+            else if (pf != base.pixelFormat && !(base.usage & MTLTextureUsagePixelFormatView)) { base = tex_upgrade_usage(&rp->t, base, MTLTextureUsagePixelFormatView); if (g_tex_prepare_split) return NULL; sg = g_ser_gen; }
         }
         { uint32_t upf; int ubpp; if (r.v.set_format && bc1_fmt(r.v.format) && pf_astc4(base.pixelFormat)) pf = (uint32_t)bc1_astc_pf(r.v.format);   // TOTK: BC1 view of a transcoded (ASTC) texture
           else if (r.v.set_format && tc_pf(r.v.format) != MTLPixelFormatInvalid && tc_pf(r.t.d.format) == base.pixelFormat) pf = (uint32_t)tc_pf(r.v.format);   // TOTK: view of a BC2/3/4/5/7 texture stored transcoded (tex_tc)
           else if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // 无 BC：BC 视图跟底图一样换成解压后的格式 | No BC: a BC view is switched to the decompressed format just like the base texture
         if (r.v.set_format && tex_need_pfv(base.pixelFormat, (MTLPixelFormat)pf) && !(base.usage & MTLTextureUsagePixelFormatView)) {
-            base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf);
+            base = tex_upgrade_usage(&rp->t, base, MTLTextureUsagePixelFormatView);
             if (g_tex_prepare_split) return NULL;
             sg = g_ser_gen;
         }
@@ -10159,6 +10167,9 @@ static void driver_bank_fill(uint8_t *d, int bank, int stage) {
         } else if (stage == 0) {   // TOTK: point-size limit the vertex shaders clamp gl_PointSize to (the driver's hardware limit 0x44fffe00 = 2047.9375)
             const float ps_max = 2047.9375f; memcpy(d + 0x610, &ps_max, sizeof ps_max);
         }
+        /* Ocarina of Time's title vertex shader (GLSLC) reads the draw's base instance at 0x644 and adds it to the instance
+           ID (seedds/nxnative dmsh_abi.h DMSH_C0_BASE_INSTANCE). We pass baseInstance to Metal instead (indirect args), so
+           the word stays 0 as memset left it; direct instanced draws always have base 0. */
     } else {
         for (int r = 0; r < 128; r++) { uint32_t th = (uint32_t)S.tex[stage][r], sh_ = (uint32_t)S.samp[stage][r]; memcpy(d + 0x168 + 8 * r, &th, 4); memcpy(d + 0x568 + 8 * r, &sh_, 4); }
         for (int r = 0; r < 32; r++) { uint32_t th = (uint32_t)S.tex[stage][r]; memcpy(d + 0x20 + 8 * r, &th, 4); }   /* TOTK: combined handle table (BindTexture) */
@@ -10434,6 +10445,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (nvn_stage == 1 && reg == 0 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR")) g_flash_hdr_source = t;
             if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu mem=%p sz=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial, (void *)g_treg[tid].t.mem, (unsigned long long)g_treg[tid].t.L.size);
+            if (t && tid < g_ntreg) { void td_note_bind(uint64_t, id<MTLTexture>); td_note_bind(g_treg[tid].t.serial, t); }   /* TEMP probe (OoT) */
             if (t && tid < g_ntreg) tp_note_fs(sh->key, g_treg[tid].t.serial, &g_treg[tid].t);   // TOTK: DM_NVN_TEXPNG_FS
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu nvnfmt=%#x vfmt=%#x fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0,
                        tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg && g_treg[tid].has_v && g_treg[tid].v.set_format ? g_treg[tid].v.format : 0ull,
@@ -10466,7 +10478,13 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
+            if (t && !(t.usage & MTLTextureUsageShaderWrite)) {   // bound without the IMAGE flag: make it writable (the copy opens its own encoder, the dispatch follows behind it)
+                tex_ensure_writable(tid);
+                void *tv2 = NULL; uint64_t trid2 = tid ? tex_fast_rid(tid, &tv2) : 0;
+                if (tv2) { t = (__bridge id<MTLTexture>)tv2; trid = trid2; }
+            }
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
+            if (t && tid < g_ntreg) { void td_note_bind(uint64_t, id<MTLTexture>); td_note_bind(g_treg[tid].t.serial, t); }   /* TEMP probe (OoT): the image write target too */
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
@@ -10931,7 +10949,11 @@ static int state_op(uint32_t op, const void *a) {
         case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage < 6 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; args_dirty_stage(b->stage); } break; }
         case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage < 6 && b->first + b->n <= 128 && memcmp(&S.tex[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * b->n); TEX_CHANGED(b->stage); args_dirty_stage(b->stage); if (b->first + b->n > g_tex_hi[b->stage]) g_tex_hi[b->stage] = b->first + b->n; } break; }
         case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage < 6 && b->first + b->n <= 128 && memcmp(&S.samp[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.samp[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); } break; }
-        case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) { if (memcmp(&S.img[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); } } else RED_ONCE(31, "图像槽越界 阶段 %d 起 %d 数 %d", b->stage, b->first, b->n); break; }
+        case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) { if (memcmp(&S.img[b->stage][b->first], b->h, 8 * b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * b->n); args_dirty_stage(b->stage); }
+            /* NVN lets a texture be bound as an image without declaring NVN_TEXTURE_FLAGS_IMAGE (OoT's movie library binds its NDVE output that way); the real driver makes it writable.
+               Add ShaderWrite to the host texture once, before the dispatch opens an encoder; inside one, the copy would split it, so leave it to the dummy fallback at bind time. */
+            if (!rp_active()) for (int k = 0; k < b->n; k++) tex_ensure_writable((int)(b->h[k] & 0xfffff));
+        } else RED_ONCE(31, "图像槽越界 阶段 %d 起 %d 数 %d", b->stage, b->first, b->n); break; }
         case OP_STENCIL: {
             const p_stencil *b = a;
             if (b->which != 2) g_dss_dirty = 1;
@@ -10948,6 +10970,22 @@ static int state_op(uint32_t op, const void *a) {
         case OP_RENDER_COND: S.render_disabled = !cond_eval(a, (const uint8_t *)a - 8); PD("E cond addr=%#llx mode=%d -> %s", (unsigned long long)((const p_render_cond *)a)->addr, ((const p_render_cond *)a)->mode, S.render_disabled ? "disabled" : "enabled"); break;
         case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value; break;
         case OP_PUSH_CONST: { const p_push_const *b = a;   /* NVN2 push constants into the graphics (0) or compute (1) block */
+            if (b->compute < 2 && (uint32_t)b->offset + b->size <= NVN_PUSH_SIZE) {   /* TEMP probe (OoT): what the game pushes, once per size per frame (TOTK_WAIT_LOG) */
+                static int pp = -1; if (pp < 0) pp = getenv("TOTK_WAIT_LOG") != NULL;
+                if (pp) {
+                static uint64_t seen[8]; static uint64_t pframe; uint64_t f = atomic_load(&g_cur_frame);
+                if (f != pframe) { pframe = f; memset(seen, 0, sizeof seen); }
+                uint64_t tag = ((uint64_t)b->compute << 40) | ((uint64_t)b->offset << 16) | b->size;
+                int slot = -1; for (int q = 0; q < 8; q++) if (!seen[q]) { slot = q; break; } else if (seen[q] == tag) { slot = -1; break; }
+                if (slot >= 0) { seen[slot] = tag;
+                    MLOG("[push-probe] F%llu c%d off=%#x size=%u head=%08x %08x %08x %08x f=[%.4g %.4g %.4g %.4g]", (unsigned long long)f,
+                        b->compute, b->offset, b->size, ((uint32_t *)b->data)[0], ((uint32_t *)b->data)[1], ((uint32_t *)b->data)[2], ((uint32_t *)b->data)[3],
+                        ((float *)b->data)[0], ((float *)b->data)[1], ((float *)b->data)[2], ((float *)b->data)[3]);
+                    if (b->size >= 84) {   /* TEMP probe (OoT): the upscale program reads _m0[2].z/.w and the _m0[5].x flag — dump words 8..20 */
+                        char tb[512]; int o = 0;
+                        for (int w = 8; w < 21 && (size_t)(w * 4 + 4) <= b->size; w++)
+                            o += snprintf(tb + o, sizeof tb - o, " w%d=%08x/%.4g", w, ((uint32_t *)b->data)[w], ((float *)b->data)[w]);
+                        MLOG("[push-probe] F%llu tail:%s", (unsigned long long)f, tb); } } } }
             if (b->compute < 2 && (uint32_t)b->offset + b->size <= NVN_PUSH_SIZE && memcmp(S.push[b->compute] + b->offset, b->data, b->size)) { memcpy(S.push[b->compute] + b->offset, b->data, b->size); args_dirty_all(); }
             break; }
         default: return 0;
@@ -14916,6 +14954,14 @@ static void dispatch(const p_dispatch *dp) {
       if (logk) { if (!seen) seen = [NSMutableSet set]; NSString *k = @(cs->key); if (![seen containsObject:k]) { [seen addObject:k]; MLOG("[cs-first] frame %llu %.16s", (unsigned long long)atomic_load(&g_cur_frame), cs->key); } }
       if (all) return;
       for (int i = 0; i < nl; i++) if (list[i][0] && !strncmp(cs->key, list[i], strlen(list[i]))) return; }
+    { static const char *gl; static uint64_t gf; static int rd;   /* TEMP probe (OoT): dispatch grid + output serial for a key prefix, once per frame */
+      if (!rd) { rd = 1; gl = getenv("TOTK_GRID_LOG"); }
+      if (gl && !strncmp(cs->key, gl, strlen(gl))) { uint64_t f = atomic_load(&g_cur_frame);
+          if (f != gf) { gf = f; uint64_t iser = 0;
+              for (int i = 0; i < cs->rf.nb; i++) { const nvn_rbind *b = &cs->rf.b[i];
+                  if (b->kind == NVN_RB_IMG && b->reg < 32) { int tid = (int)(S.img[5][b->reg] & 0xfffff); if (tid && tid < g_ntreg) iser = g_treg[tid].t.serial; } }
+              MLOG("[grid-probe] F%llu %.16s grid %ux%ux%u tg %u,%u,%u img_ser=%llu", (unsigned long long)f, cs->key,
+                   dp->x, dp->y, dp->z, cs->rf.tg[0], cs->rf.tg[1], cs->rf.tg[2], (unsigned long long)iser); } } }
     /* TOTK_CS_UBO_LOG=<key prefix> (diagnostic): the first dispatches of that compute shader name each uniform buffer it
        reads (slot, address, size) and its first 8 words as the CPU sees them when the dispatch is encoded. */
     { static const char *want; static int read, left = 6;
@@ -15207,7 +15253,9 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
 static void copy_b2t(const p_copy_b2t *c) {
     { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
       if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
-          MLOG("[%s] f%llu tex ser=%llu %ux%u fmt=%#x mem=%p buf=%#llx", "b2t", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, (void *)c->tex->mem, (unsigned long long)c->src); } }
+          void *xb; uint64_t xo; const uint8_t *xb0 = mtl_addr(c->src, 16, &xb, &xo) ? (const uint8_t *)[(__bridge id<MTLBuffer>)xb contents] : NULL;   /* TEMP probe: source bytes */
+          char hx[64]; hx[0] = 0; if (xb0) for (int q = 0; q < 16; q++) sprintf(hx + q * 2, "%02x", xb0[xo + q]);
+          MLOG("[%s] f%llu tex ser=%llu %ux%u fmt=%#x mem=%p buf=%#llx r=%d,%d %dx%d src16=%s", "b2t", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, (void *)c->tex->mem, (unsigned long long)c->src, c->r.xoffset, c->r.yoffset, c->r.width, c->r.height, hx); } }
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
@@ -15352,7 +15400,7 @@ static void clear_tex(const p_clear_tex *c) {
     if (c->has_view && c->view.set_format) {   // 视图换格式：清除值按视图格式解释（游戏 5 次全是 ui 版配整数视图），在同格式视图上清 | View with changed format: the clear value is interpreted in the view format (all 5 of the game's calls are the ui version with an integer view), and the clear is done on a view of the same format
         uint32_t vpf = 0; uint8_t swz[4];
         if (!nvn_fmt_to_mtl(c->view.format, &vpf, swz) || !vpf) { RED_ONCE(42, "清贴图视图格式 %#x 无对应", c->view.format); return; }
-        if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && !(t.usage & MTLTextureUsagePixelFormatView)) t = tex_upgrade_pfv(c->tex, t, (MTLPixelFormat)vpf);
+        if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && !(t.usage & MTLTextureUsagePixelFormatView)) t = tex_upgrade_usage(c->tex, t, MTLTextureUsagePixelFormatView);
         if (t.pixelFormat != (MTLPixelFormat)vpf) {
             id<MTLTexture> v = [t newTextureViewWithPixelFormat:(MTLPixelFormat)vpf];
             if (!v) { RED_ONCE(43, "清贴图建不出视图：格式 %lu → %u", (unsigned long)t.pixelFormat, vpf); return; }
@@ -15989,6 +16037,13 @@ void td_note(MTL4RenderPassDescriptor *pd, NSUInteger nc) {
         BOOL seen = NO; for (NSArray *e in g_td_list) if ([e[1] unsignedLongLongValue] == ser && [e[2] unsignedIntegerValue] == lv) seen = YES;
         if (!seen) [g_td_list addObject:@[t, @(ser), @(lv)]];
     }
+}
+void td_note_bind(uint64_t ser, id<MTLTexture> t) {   /* TEMP probe (OoT): the pass dump's bind lines also feed the texdump list,
+   so a dump frame captures the compute stage's inputs and outputs, not only render targets. */
+    if (g_td_frame < 0 || g_td_done || !g_td_list || !t || !ser) return;
+    if ((long)atomic_load(&g_cur_frame) != g_td_frame) return;
+    for (NSArray *e in g_td_list) if ([e[1] unsignedLongLongValue] == ser) return;
+    [g_td_list addObject:@[t, @(ser), @0]];
 }
 static NSMutableArray *g_ts_made;   // DM_NVN_TEXSNAP copies made for this dump (resident until saved)
 static void td_dump_body(void);

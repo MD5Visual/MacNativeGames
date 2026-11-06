@@ -53,7 +53,11 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"sbuf_ubo"]) { r->kind = NVN_RB_SBUFU; r->rw = refl_rw(b); r->off = (uint16_t)[b[@"off"] intValue]; }
             else if ([k isEqualToString:@"support"]) r->kind = NVN_RB_SUPPORT;
             else if ([k isEqualToString:@"c1"]) r->kind = NVN_RB_C1;
-            else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            else if ([k isEqualToString:@"drvcb"]) {   /* bank 24 = NVN2 push constants (NVN_PUSH_BANK): bind as c[24] so nvn_mtl.m supplies S.push, not the c0 SSBO table */
+                int bank = [b[@"bank"] intValue];
+                if (bank == 24) { r->kind = NVN_RB_CBUF; r->reg = reg = 24; }   /* reg too: the slot check below reads the local */
+                else r->kind = bank == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            }
             else if ([k isEqualToString:@"gmem_map"]) r->kind = NVN_RB_GMEM;
             else if ([k isEqualToString:@"geometry"]) { r->kind = NVN_RB_GEO; if (reg < 0 || reg > 4) FAIL("geometry helper %s: reg %d", [b[@"msl_name"] UTF8String], reg); }
             else if ([k isEqualToString:@"gmem_log"]) { r->kind = NVN_RB_GMEML; r->rw = 1; }

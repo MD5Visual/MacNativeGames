@@ -36,9 +36,12 @@ static partial class ShaderService
     static readonly string[] Xc = { "--msl", "--msl-version", "20300", "--msl-argument-buffers", "--msl-texture-buffer-native", "--msl-pad-fragment-output" };
     // Driver-segment words the replay fills, per stage (nvn_mtl.m drv_fillable / encode_args): c0 storage-buffer table of the
     // stage, compute thread-group counts (0x200) and uniform-buffer table (0x210), vertex point-size limit (0x610); c2 handles.
+    // 0x640-0x650: the draw's base instance at +0x644, which GLSLC adds to the instance ID (seedds/nxnative dmsh_abi.h
+    // DMSH_C0_BASE_INSTANCE; Ocarina of Time's title vertex shader b19e1bdd247555ec reads the row). The replay passes
+    // baseInstance to Metal instead, so it supplies 0 there.
     static readonly Dictionary<string, (long lo, long hi)[]> DrvFillC0 = new()
     {
-        ["vs"] = new[] { (0x110L, 0x210L), (0x610L, 0x620L) }, ["ps"] = new[] { (0x510L, 0x610L) }, ["cs"] = new[] { (0x200L, 0x410L) },
+        ["vs"] = new[] { (0x110L, 0x210L), (0x610L, 0x620L), (0x640L, 0x650L) }, ["ps"] = new[] { (0x510L, 0x610L), (0x640L, 0x650L) }, ["cs"] = new[] { (0x200L, 0x410L) },
         ["gs"] = new[] { (GsSsboBase, GsSsboBase + 0x100) },   // the geometry stage's storage buffer table
     };
     // c0 + 0x410 + 0x10 r: the geometry stage's storage buffer r (seedds/nxnative dmsh_abi.h DMSH_C0_SSBO_GS, NieR:Automata;
@@ -544,9 +547,65 @@ static partial class ShaderService
         new(tex.Where(kv => kv.Value is JsonValue v && v.GetValueKind() == JsonValueKind.String && v.GetValue<string>().EndsWith("_depth", StringComparison.Ordinal))
                .Select(kv => ParseInt(kv.Key)));
 
+    // Ampere HMMA.16816 with f16 accumulators (the agl/NDSR neural-network kernels, e.g. OoT's movie upscaler): the
+    // translator emits a scalar body for dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1, out D1) -> D0 and the
+    // 0006 patch says the shader build replaces that body with simdgroup_matrix code over the same scratch block
+    // ("the name, the arguments and the block are the contract"). The scalar body is wrong in practice: the OoT NDVE
+    // program writes exactly zero (or saturated garbage once the source shifts) with it. Same replacement as nxnative's hmma_msl.
+    const string HmmaBody = "\n{\n" +
+        "    threadgroup uint* s = &%(scr)s[uint(%(blk)s)];\n" +
+        "    uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;\n" +
+        "    s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s);\n" +
+        "    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);\n" +
+        "    s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s);\n" +
+        "    simdgroup_barrier(mem_flags::mem_threadgroup);\n" +
+        "    threadgroup half* h = (threadgroup half*)s;\n" +
+        "    simdgroup_half8x8 a00, a01, a10, a11, b0, b1, c0, c1;\n" +
+        "    simdgroup_load(a00, h, 16, ulong2(0, 0)); simdgroup_load(a01, h, 16, ulong2(8, 0)); simdgroup_load(a10, h, 16, ulong2(0, 8)); simdgroup_load(a11, h, 16, ulong2(8, 8));\n" +
+        "    simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);\n" +
+        "    simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8));\n" +
+        "    simdgroup_multiply_accumulate(c0, a00, b0, c0); simdgroup_multiply_accumulate(c0, a01, b1, c0);\n" +
+        "    simdgroup_multiply_accumulate(c1, a10, b0, c1); simdgroup_multiply_accumulate(c1, a11, b1, c1);\n" +
+        "    simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));\n" +
+        "    simdgroup_barrier(mem_flags::mem_threadgroup);\n" +
+        "    uint d0 = s[192 + g * 4 + t], d1 = s[192 + (g + 8) * 4 + t];\n" +
+        "    simdgroup_barrier(mem_flags::mem_threadgroup);\n" +
+        "    %(d1)s = as_type<%(dt)s>(d1);\n" +
+        "    return as_type<%(rt)s>(d0);\n" +
+        "}\n";
+    static string HmmaMsl(string src)
+    {
+        var m = Regex.Match(src, @"\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{");
+        if (!m.Success) return src;
+        var ps = new List<string>(); int depth = 0; string cur = "";
+        foreach (char ch in m.Groups[2].Value + ",")
+        {
+            if (ch == '<') depth++; else if (ch == '>') depth--;
+            if (ch == ',' && depth == 0) { ps.Add(cur.Trim()); cur = ""; } else cur += ch;
+        }
+        var scr = ps.Where(x => x.StartsWith("threadgroup ")).ToList();
+        var plain = ps.Where(x => !x.StartsWith("threadgroup ")).ToList();
+        string Bad() => "dmsh_hmma16816_f16: unexpected parameters " + m.Groups[2].Value.Substring(0, Math.Min(200, m.Groups[2].Value.Length));
+        if (scr.Count != 1 || plain.Count != 11) throw new RuntimeError(Bad());
+        string Name(string x) { var mm = Regex.Match(x, @"(\w+)$"); if (!mm.Success) throw new RuntimeError(Bad()); return mm.Groups[1].Value; }
+        var dtm = Regex.Match(plain[10], @"^thread (\w+)&"); if (!dtm.Success) throw new RuntimeError(Bad());
+        string body = HmmaBody;
+        string[] keys = ["lane", "blk", "a0", "a1", "a2", "a3", "b0", "b1", "acc0", "acc1", "d1"];
+        for (int i = 0; i < keys.Length; i++) body = body.Replace("%(" + keys[i] + ")s", Name(plain[i]));
+        body = body.Replace("%(scr)s", Name(scr[0])).Replace("%(dt)s", dtm.Groups[1].Value).Replace("%(rt)s", m.Groups[1].Value);
+        int start = m.Index + m.Length - 1; depth = 0; int end = -1;
+        for (int i = start; i < src.Length; i++)
+        {
+            if (src[i] == '{') depth++; else if (src[i] == '}') depth--;
+            if (depth == 0) { end = i; break; }
+        }
+        if (end < 0) throw new RuntimeError("dmsh_hmma16816_f16: body not closed");
+        return src.Substring(0, start) + body + src.Substring(end + 1);
+    }
     // the MSL steps after SPIRV-Cross that every stage takes
     static string PostProcess(string src, HashSet<long> depthSlots)
     {
+        src = HmmaMsl(src);
         if (depthSlots.Count > 0)
             src = RewriteDepthTextures(src, depthSlots);
         src = MatchSwitchDepthSampling(src);

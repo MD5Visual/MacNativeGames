@@ -257,6 +257,7 @@ static void *input_file(void *arg) {
             if (ferror(f)) runtime_fail("diagnostic input read");
             static int once; if (!once) { once=1; fprintf(stderr, "[totk-input] EOF branch reached\n"); }   /* TEMP probe */
             clearerr(f); usleep(100000);
+            { extern void runtime_park_check(void); runtime_park_check(); }   /* TEMP probe (OoT): park watchdog, host-side */
             { struct stat n2,h2; if (!stat((const char *)arg,&n2) && !fstat(fileno(f),&h2)) { static int rep; rep++; if (rep<=5 || rep%50==1) fprintf(stderr,"[totk-input] iter %d path ino=%lld fd ino=%lld\n",rep,(long long)n2.st_ino,(long long)h2.st_ino); } }   /* TEMP probe */
             /* A file replaced instead of appended to (devicectl device copy to an iPhone's Documents writes a new file, so
                this stream would stay on the old one and never see another line): open the new one. The writer copies the
