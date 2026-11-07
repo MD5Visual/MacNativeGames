@@ -16,15 +16,26 @@ static inline int romfs_path_valid_relative(const char *path) {
     return 1;
 }
 
-static inline const char *romfs_path_relative(const char *mount, const char *path) {
+static inline const char *romfs_path_relative(const char *mount, const char *path,
+                                              char *scratch, size_t capacity) {
     if (!mount || !*mount || !path) return NULL;
     size_t size = strlen(mount);
     if (strncmp(path, mount, size) || path[size] != ':' || path[size + 1] != '/')
         return NULL;
     path += size + 2;
-    /* Audio stream requests join a mount root and a leading-slash resource,
-       producing content://Sound/.... Normalize root separators only; keep
-       rejecting traversal, backslashes and empty interior components. */
+    /* Audio stream requests can join a mount root and a leading-slash resource. */
     while (*path == '/') ++path;
-    return romfs_path_valid_relative(path) ? path : NULL;
+    if (romfs_path_valid_relative(path)) return path;
+    if (!scratch || !strstr(path, "//")) return NULL;
+
+    /* OoT also joins audio subdirectories with duplicate separators, e.g.
+       Voice/Resource//Stream. Validate the collapsed path before lookup. */
+    size_t used = 0;
+    for (const char *p = path; *p; ++p) {
+        if (used + 1 >= capacity) return NULL;
+        scratch[used++] = *p;
+        if (*p == '/') while (p[1] == '/') ++p;
+    }
+    scratch[used] = '\0';
+    return romfs_path_valid_relative(scratch) ? scratch : NULL;
 }

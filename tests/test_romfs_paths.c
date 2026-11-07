@@ -34,7 +34,7 @@ int main(void) {
         {"rom", "rom://dir\\file", NULL},
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
-        const char *result = romfs_path_relative(cases[i].mount, cases[i].path);
+        const char *result = romfs_path_relative(cases[i].mount, cases[i].path, NULL, 0);
         if ((!result != !cases[i].expected) ||
             (result && strcmp(result, cases[i].expected))) {
             fprintf(stderr, "case %zu failed: %s -> %s (expected %s)\n", i,
@@ -43,6 +43,17 @@ int main(void) {
                     cases[i].expected ? cases[i].expected : "(null)");
             return 1;
         }
+    }
+    char normalized[128];
+    const char *voice = romfs_path_relative("content", "content://Voice/Resource//Stream/opening.bwav",
+                                           normalized, sizeof normalized);
+    if (!voice || strcmp(voice, "Voice/Resource/Stream/opening.bwav") ||
+        romfs_path_relative("content", "content://Voice//../file", normalized, sizeof normalized) ||
+        romfs_path_relative("content", "content://Voice//./file", normalized, sizeof normalized) ||
+        romfs_path_relative("content", "content://Voice//dir\\file", normalized, sizeof normalized) ||
+        romfs_path_relative("content", "content://Voice//file", normalized, 10)) {
+        fputs("OoT audio path normalization failed\n", stderr);
+        return 1;
     }
     printf("PASS: %zu RomFS path cases\n", sizeof cases / sizeof cases[0]);
     return 0;
