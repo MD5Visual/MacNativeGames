@@ -6723,7 +6723,8 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (rp->view) {   // 序号表或客体内存有过变动：核基贴图是否被重传换新，换了则视图作废 | The serial table or guest memory has changed: check whether the base texture was re-uploaded and replaced; if so the view is invalidated
         __unsafe_unretained id<MTLTexture> cur = tex_mtl(&rp->t);   // held by the serial table / its NvPkg
         if (g_tex_prepare_split) return NULL;
-        if ((__bridge void *)cur == rp->view || (__bridge void *)cur == rp->view_parent) { rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg; return rp->view; }
+        /* A missing base must not validate a cached view with no parent. */
+        if (cur && ((__bridge void *)cur == rp->view || (__bridge void *)cur == rp->view_parent)) { rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg; return rp->view; }
         treg_clear_view_locked(tid);
     }
     id<MTLTexture> v = nil;
@@ -18244,6 +18245,13 @@ int mtl_probe_texture_retire(void) {
     mtl_sub_commit();mtl_finish();for(unsigned i=0;i<128;i++){if(((uint8_t *)rb.contents)[i]!=expected[i])MDIE("texture retire rebuilt view pixel%u",i);checked++;}
     mtl_sub_begin();mtl_exec((const uint8_t *)&end);mtl_sub_commit();mtl_finish();
     if(replaced_type)MDIE("texture retire: replaced type view retained after GPU completion");checked++;
+    registry_lock();
+    if(!g_treg[1].view||g_treg[1].view_parent)MDIE("texture retire: missing-base fixture needs a standalone cached texture");
+    g_treg[1].t.serial=0;
+    g_treg[1].dead_pending=1;
+    if(tex_by_id_p(1)||g_treg[1].view_rid)MDIE("texture retire: missing base revalidated a stale resource ID");
+    g_treg[1].t.serial=t.serial;
+    registry_unlock();checked++;
     mtl_tex_release(&t);
     registry_lock();
     for(unsigned i=1;i<=N*2;i++) { if(g_treg[i].view||g_treg[i].indexed_serial)MDIE("texture retire: finalized serial kept descriptor %u",i);checked++; }
