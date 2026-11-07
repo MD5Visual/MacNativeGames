@@ -39,10 +39,11 @@
 _Noreturn void runtime_fail(const char *message) { fprintf(stderr, "FAIL %s\n", message); exit(1); }
 void runtime_thread_init(void) {}
 uint64_t runtime_now_ns(void) { mach_timebase_info_data_t t; mach_timebase_info(&t); return (uint64_t)((__uint128_t)mach_absolute_time() * t.numer / t.denom); }
-#ifdef GAME_BOTW
+/* The synthetic guest has no loaded modules and never runs on an HLE stack. */
+pthread_key_t runtime_keys[8];
 uint64_t runtime_hle_tsd_off;                                   /* hle_stack.c: 0 = no host-stack slot, the preemption signal does nothing */
 int runtime_guest_code_pc(uint64_t pc) { (void)pc; return 0; }  /* loader.c */
-#endif
+uint8_t *runtime_module_base(const char *name) { (void)name; return NULL; }
 void hle_bind_system_event(void *event, int autoclear);
 void hle_signal_system_event(void *event);
 static void need(int c, const char *m) { if (!c) runtime_fail(m); }
@@ -110,6 +111,8 @@ static int decoy_once(void) {
 static int wake_part(void);
 static int arbiter_part(void);
 int main(int argc, char **argv) {
+    for (unsigned i = 0; i < 8; i++)
+        need(pthread_key_create(&runtime_keys[i], NULL) == 0 && runtime_keys[i] != 0, "Darwin thread key");
     svc_thread_main_init();
     if (argc > 1 && !strcmp(argv[1], "decoy")) return decoy_once();
     if (argc > 1 && !strcmp(argv[1], "wake")) return wake_part();
