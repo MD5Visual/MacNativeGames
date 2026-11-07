@@ -1212,7 +1212,12 @@ void mtl_eye_done(int left, int last) {   // after an eye pass's commit (hle_nvn
         else MLOG("[vr] b2shot: this eye pass drew no presented texture"); }
 }
 void mtl_eye_capture(int eye) { g_b2_capture = eye; }
+static id<MTLTexture> g_oot_movie_decoded;
+static uint64_t g_oot_movie_sub;
+static const uint8_t *g_oot_movie_skip_end;
 void mtl_sub_begin(void) {
+    g_oot_movie_decoded = nil;
+    g_oot_movie_skip_end = NULL;
     g_eye_region = 3;   // stereo B2: a submission starts outside eye marks
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     /* The submission's autorelease pool, drained in mtl_sub_commit, opens before anything else: the guest's submit
@@ -14934,7 +14939,8 @@ static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     if (g_disp_n % 20000 == 0) MLOG("[nvn] 计算派发 至 %llu 次：其中 %llu 次（%.0f%%）接在已开的计算编码器里，没有另开编码器", (unsigned long long)g_disp_n, (unsigned long long)g_disp_shared, 100.0 * (double)g_disp_shared / (double)g_disp_n);
     return g_blit;
 }
-static void dispatch(const p_dispatch *dp) {
+#include "oot_movie_direct.inc"
+static void dispatch_at(const p_dispatch *dp, const uint8_t *next) {
     zskip_clear();
     const prog_t *cp = S.cprog ? S.cprog : S.prog;   // the compute program (S.cprog); a probe that sets S.prog only, as before
     if (!cp) { RED_ONCE(27, "派发前没有绑定程序"); return; }
@@ -14945,6 +14951,9 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
+    int movie = oot_movie_enabled() && dp->x > 0 && dp->y > 0 && dp->z == 1 ? oot_movie_role(cs->key) : 0;
+    if (movie == 1) g_oot_movie_decoded = nil;
+    if (movie == 2 && oot_movie_replace(cs)) return;
     /* TOTK_SKIP_CS=all | <key prefix>[,<key prefix>...] (diagnostic): those compute dispatches are not run (bisecting a
        GPU hang to its shader); TOTK_SKIP_CS_LOG=1 names each compute shader once as it is first dispatched. */
     { static char list[16][17]; static int nl = -1, all, logk; static NSMutableSet *seen;
@@ -15028,6 +15037,10 @@ static void dispatch(const p_dispatch *dp) {
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.16s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
+    if (movie == 1) {
+        oot_movie_remember(cs);
+        g_oot_movie_skip_end = oot_movie_try_network(next);
+    }
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its
        storage buffer 0 (statistics; exposure at 108..111) into a shared ring and write them with the frame number once
@@ -15045,6 +15058,7 @@ static void dispatch(const p_dispatch *dp) {
 }
 // GPU：贴图 → 缓冲（行距取 SetCopyRowStride，0 = 紧排）
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
+static void dispatch(const p_dispatch *dp) { dispatch_at(dp, NULL); }
 static void copy_t2b(const p_copy_b2t *c) {
     { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
       if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
@@ -15766,7 +15780,11 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_T2B: copy_t2b(a); break;
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
-            case OP_DISPATCH: dispatch(a); break;
+            case OP_DISPATCH:
+                if (g_oot_movie_skip_end) {
+                    if (p == g_oot_movie_skip_end) g_oot_movie_skip_end = NULL;
+                } else dispatch_at(a, p + h.size);
+                break;
             case OP_SET_TEX_POOL: { const dpool_t *tp = ((const p_set_pool *)a)->pool; extern int nvn_tex_pool_base(const void *pool);   // hle_nvn.c: IDs past this pool's part of the table read 0
                                     S.tex_pool_n = tp ? nvn_tex_pool_base(tp) + tp->n : 0; break; }
             case OP_BARRIER: case OP_SET_SAMP_POOL: break;
@@ -18171,6 +18189,8 @@ int mtl_probe_compressed_alias(void) {
 
 /* CPU-visible linear-render-target textures contain ordinary pool data until the GPU writes them.
    Exercise both water-height formats, cold sampling, a CPU texel update, and subsequent GPU rendering. */
+#include "oot_movie_probe.inc"
+
 int mtl_probe_linear_rt_upload(void) {
     mtl_init();int checked=0;
     for(int mode=0;mode<2;mode++) {
