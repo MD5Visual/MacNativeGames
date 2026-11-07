@@ -176,10 +176,13 @@ probe-thread: build/thread-probe
 # CPU only, against the real threads.c: SystemEvent bindings end with their write handle, a signal wakes only the waiters of
 # the signalled object, SignalToAddress writes mesosphère's value (tests/system_event_bind/probe.c; GAME_BOTW=1 for BotW's build)
 build/system-event-probe: tests/system_event_bind/probe.c runtime/threads.c runtime/thread_enter.S
+	mkdir -p "$(dir $@)"
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror $(if $(GAME_BOTW),-DGAME_BOTW=1) -Ithird_party/d2r_gfx/gfx/nvn/include tests/system_event_bind/probe.c runtime/threads.c runtime/thread_enter.S -o "$@"
 
 probe-system-event: build/system-event-probe
-	build/system-event-probe | tee analysis/system-event-probe.log
+	mkdir -p analysis
+	build/system-event-probe > analysis/system-event-probe.log
+	@cat analysis/system-event-probe.log
 
 .PHONY: probe-account probe-gfx
 probe-account:
