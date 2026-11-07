@@ -71,6 +71,17 @@ static void show_error(uint32_t result) {
     fprintf(stderr, "[totk] game error dialog: %04u-%04u (result %#x)\n", 2000 + (result & 0x1ff), (result >> 9) & 0x1fff, result);
 }
 
+#ifdef GAME_OOT
+/* Zelda Notes requests the console web applet. OoT handles a failed Result
+ * without reading the return value object. */
+static uint32_t show_web_page(void *result, const void *arg) {
+    (void)result;
+    (void)arg;
+    fprintf(stderr, "[oot] web applet unavailable\n");
+    return 0x2a2u; /* Generic failure, as used by the other offline applet hosts. */
+}
+#endif
+
 #ifdef GAME_BOTW
 /* SDK 7 (Breath of the Wild 1.6.0, botw.md). Exit requests are handled by the window (the section brackets change nothing);
    video recording has no Mac counterpart; the DLC shop and the DLC-version error screen are console applets. */
@@ -105,6 +116,9 @@ void *runtime_applet_override(const char *name) {
         {"_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn3err9ShowErrorENS_6ResultE", show_error},
+#ifdef GAME_OOT
+        {"_ZN2nn3web11ShowWebPageEPNS0_18WebPageReturnValueERKNS0_14ShowWebPageArgE", show_web_page},
+#endif
 #ifdef GAME_BOTW
         {"_ZN2nn2oe31EnterExitRequestHandlingSectionEv", exit_section}, {"_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", exit_section},
         {"_ZN2nn2oe15EnableRecordingEv", enable_recording},
