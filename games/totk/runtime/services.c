@@ -395,9 +395,9 @@ static void lv_log(const char *tag, void *ev){if(!oot_probe())return;unsigned ch
  pthread_threadid_np(NULL,&tid);
  fprintf(stderr,"[lv-probe] %s th=%llx ev=%llx [%02x %02x %02x %02x %02x %02x %02x %02x]\n",tag,(unsigned long long)tid,(unsigned long long)(uintptr_t)ev,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);fflush(stderr);}
 static void observed_light_wait(void *ev){lv_log("W ",ev);
- ((void(*)(void*))runtime_symbol("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE"))(ev);if(oot_probe())fprintf(stderr,"[lv-probe] W  -> done\n");fflush(stderr);}
+ ((void(*)(void*))runtime_symbol("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE"))(ev);if(oot_probe()){fprintf(stderr,"[lv-probe] W  -> done\n");fflush(stderr);}}
 static uint32_t observed_light_timedwait(void *ev,uint64_t ts){lv_log("TW",ev);
- uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"))(ev,ts);if(oot_probe())fprintf(stderr,"[lv-probe] TW -> %x\n",r);fflush(stderr);return r;}
+ uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"))(ev,ts);if(oot_probe()){fprintf(stderr,"[lv-probe] TW -> %x\n",r);fflush(stderr);}return r;}
 static void observed_light_signal(void *ev){lv_log("S ",ev);
  ((void(*)(void*))runtime_symbol("_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE"))(ev);}
 static void observed_light_clear(void *ev){lv_log("C ",ev);
