@@ -1,6 +1,7 @@
 // TOTK: system load for the bottom-right line (user, 2026-10-16 night: the load of every CPU core and of the GPU, on one
 // line like the FPS counter). See totk_sysload.c.
 #pragma once
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -18,6 +19,10 @@ int sysload_get(sysload_info *out);              // 0 before the first sample
 void sysload_note_gpu(double start_s, double end_s);   // one of our command buffers ran on the GPU (CACurrentMediaTime seconds)
 /* "P 55% 56% 55% 53%  E 43% 29% 20% 12%  9%  7%  T 47%  GPU 99% (70%)" (T: the busiest thread) */
 void sysload_text(char *out, size_t n, const sysload_info *in);
+/* Missing Metal timestamps can be zero independently, even on completion. */
+static inline int sysload_gpu_span_valid(double start_s, double end_s) {
+    return start_s > 0 && end_s > start_s && isfinite(end_s);
+}
 /* Busy time of command buffers that complete in order: the union of their [start, end) intervals. Returns what was added. */
 typedef struct { double last_end, busy; } sysload_busy;
 double sysload_busy_add(sysload_busy *b, double start_s, double end_s);

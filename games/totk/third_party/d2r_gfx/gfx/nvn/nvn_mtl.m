@@ -598,7 +598,10 @@ static void keepalive_start(void) {
             id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
             [ce setComputePipelineState:ps]; [ce setBuffer:buf offset:0 atIndex:0]; [ce setBytes:&iters length:4 atIndex:1];
             [ce dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; [ce endEncoding];
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { double ms = (c.GPUEndTime - c.GPUStartTime) * 1e3; static int said; if (said++ < 3) MLOG("TOTK_GPU_KEEPALIVE：自旋核一次 %.3f ms", ms);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+                double start = c.GPUStartTime, end = c.GPUEndTime;
+                if (!sysload_gpu_span_valid(start, end)) { dispatch_semaphore_signal(sem); return; }
+                double ms = (end - start) * 1e3; static int said; if (said++ < 3) MLOG("TOTK_GPU_KEEPALIVE：自旋核一次 %.3f ms", ms);
                 uint64_t us = (uint64_t)(ms * 1e3); atomic_fetch_add(&g_ka_n, 1); atomic_fetch_add(&g_ka_us, us); uint64_t mx = atomic_load(&g_ka_max_us); while (us > mx && !atomic_compare_exchange_weak(&g_ka_max_us, &mx, us)) {}
                 if (ms > 0.01) { double k = (target_us * .001) / ms; if (k > 2) k = 2; if (k < 0.5) k = 0.5; double m = n * k; n = m < 2000 ? 2000 : m > 400000 ? 400000 : (uint32_t)m; }
                 dispatch_semaphore_signal(sem); }];
@@ -2236,9 +2239,8 @@ static void gpu_tag_done(uint64_t f, double g0, double g1) {
     sysload_note_gpu(g0, g1);   // the load line's game GPU share
     unsigned k = f % GRING;
     if (atomic_load(&g_gpu[k].frame) != f) return;
-    double d = g1 - g0;
-    if (d > 0) {
-        atomic_fetch_add(&g_gpu[k].ns, (uint64_t)(d * 1e9));
+    if (sysload_gpu_span_valid(g0, g1)) {
+        atomic_fetch_add(&g_gpu[k].ns, (uint64_t)((g1 - g0) * 1e9));
         uint64_t s0 = (uint64_t)(g0 * 1e9), s1 = (uint64_t)(g1 * 1e9), v;
         for (v = atomic_load(&g_gpu[k].t0); s0 < v && !atomic_compare_exchange_weak(&g_gpu[k].t0, &v, s0);) {}
         for (v = atomic_load(&g_gpu[k].t1); s1 > v && !atomic_compare_exchange_weak(&g_gpu[k].t1, &v, s1);) {}
@@ -2318,7 +2320,10 @@ static void mtl_sub_split(void) {
         if (f.error) { atomic_store(&g_last_commit_error, 1); static int n; if (n++ < 8) MLOG("【红】分段命令缓冲错误 fence=%llu：%s", (unsigned long long)fence_next, f.error.description.UTF8String); }
     }];
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 0);
-        [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+            double start = fb.GPUStartTime, end = fb.GPUEndTime;
+            if (sysload_gpu_span_valid(start, end)) totk_tl_at(TL_GPU, (uint64_t)(start * 1e9), tlid, (uint64_t)(end * 1e9));
+        }]; }
     id<MTL4CommandBuffer> next = [g_dev newCommandBuffer];
     if (early) { w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); rs_sync(); fc1 = fc0 + (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0); }   // fc1 - fc0: the wait, as before
     [g_cb endCommandBuffer];
@@ -2423,7 +2428,10 @@ uint64_t mtl_sub_commit(void) {
     pt_finish(g_cb, o, gpu_f);
     res_commit();
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 1); totk_tl(TL_FENCE, tlid, fence);
-        [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
+        [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+            double start = fb.GPUStartTime, end = fb.GPUEndTime;
+            if (sysload_gpu_span_valid(start, end)) totk_tl_at(TL_GPU, (uint64_t)(start * 1e9), tlid, (uint64_t)(end * 1e9));
+        }]; }
     if (g_b2_capture >= 0) {   // stereo B2: the left pass's picture for the headset (the presented texture as drawn, no MetalFX)
         const int eye = g_b2_capture; g_b2_capture = -1;
         if (g_b2_swap) g_b2_pics++; else g_b2_nopic++;
@@ -3747,8 +3755,8 @@ static void up_flush(void) {
             ser_bump(0);   // 让各贴图号的视图缓存走一次慢路（缓存命中时不会经过 tex_mtl，看不到这份记录） | Make the view cache of every texture ID take the slow path once (on a cache hit tex_mtl is not passed through and this record is not seen)
             MLOG("%s上传命令缓冲被丢：这一批 %lu 张贴图记为内容未写，下次取用时重传（待重传共 %d 张）", fake_lost ? "DM_TEST_UP_LOST：" : "", (unsigned long)dsts.count, n);
         }
-        double d = f.GPUEndTime - f.GPUStartTime;
-        if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
+        double start = f.GPUStartTime, end = f.GPUEndTime;
+        if (sysload_gpu_span_valid(start, end)) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)((end - start) * 1e9));
         for (id obj in staging) res_remove(obj);
         [staging removeAllObjects];
         for (int i = 0; i < UP_POOL; i++) if (pool_mask >> i & 1) atomic_store(&g_up_pool_busy[i], 0);

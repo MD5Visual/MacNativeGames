@@ -205,6 +205,12 @@ int main(void) {
     sysload_busy b = {0, 0};
     sysload_busy_add(&b, 1.0, 1.005); sysload_busy_add(&b, 1.005, 1.010); sysload_busy_add(&b, 1.008, 1.012); sysload_busy_add(&b, 1.020, 1.020);
     CHECK(b.busy > 0.01199 && b.busy < 0.01201, "busy union of 0-5, 5-10, 8-12 ms (and an empty one) is 12 ms, got %.6f s", b.busy);
+    CHECK(sysload_busy_add(&b, 0, 2943907.0) == 0 && sysload_busy_add(&b, 1.013, 0) == 0 &&
+          sysload_busy_add(&b, 1.013, INFINITY) == 0 && sysload_busy_add(&b, NAN, 1.014) == 0 &&
+          b.last_end == 1.012 && b.busy > 0.01199 && b.busy < 0.01201,
+          "missing or nonfinite Metal timestamps must not change the measured interval");
+    CHECK(sysload_busy_add(&b, 1.013, 1.014) > 0 && b.last_end == 1.014,
+          "valid samples must remain usable after a missing timestamp");
     pthread_t spin; pthread_create(&spin, NULL, spin_main, NULL);   // a thread that keeps one core busy: the busiest thread
     sysload_start(); usleep(1200000);
     sysload_info real; int got = sysload_get(&real);

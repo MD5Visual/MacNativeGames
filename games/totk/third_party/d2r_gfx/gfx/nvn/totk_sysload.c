@@ -37,7 +37,7 @@ int sysload_enabled(void) {
 }
 
 double sysload_busy_add(sysload_busy *b, double s, double e) {
-    if (!(e > s)) return 0;
+    if (!sysload_gpu_span_valid(s, e)) return 0;
     double from = s > b->last_end ? s : b->last_end, add = e > from ? e - from : 0;
     if (e > b->last_end) b->last_end = e;
     b->busy += add;
