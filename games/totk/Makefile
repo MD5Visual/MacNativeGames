@@ -147,7 +147,7 @@ verify-boot: runtime
 
 
 
-GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
+GFX_HEADERS := third_party/d2r_gfx/gfx/nvn/oot_movie_direct.inc third_party/d2r_gfx/gfx/nvn/oot_movie_probe.inc $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
 
 build/gfx/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
@@ -515,6 +515,10 @@ build/totk-native-oot: $(wildcard runtime/*.[ch] runtime/*.m runtime/*.S) $(GFX_
 runtime-oot binary-oot: SHADER_LIST ?= ../oot/assets/shader_list.tsv
 binary-oot: build/totk-native-oot build/pso_manifest.tsv build/pso_title.tsv
 runtime-oot: binary-oot game-data-oot
+
+.PHONY: probe-gpu-oot-movie
+probe-gpu-oot-movie: build/totk-native-oot
+	MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 TOTK_OOT_MOVIE_DIRECT=1 build/totk-native-oot rewritten/oot $@
 # Production Opus-wrapper regression checks; no game assets or audio device needed.
 OPUS_TEST_WORK ?= /tmp/totk-native-opus-codec
 OPUS_PREFIX ?= /opt/homebrew/opt/opus
