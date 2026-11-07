@@ -83,108 +83,164 @@ static uint32_t socket_htonl(uint32_t v) { return htonl(v); }
 static uint16_t socket_htons(uint16_t v) { return htons(v); }
 static const char *socket_ntop(int family, const void *in, char *out, uint32_t size) { return family == 2 ? inet_ntop(AF_INET, in, out, size) : NULL; }
 
-/* ---------- nn::socket event counters (eventfd): gRPC's poller (NPLN, in main) and the movie TaskQueue (subsdk0)
-   wake through these; with them cut, gRPC finds no poll engine and aborts at boot (Ocarina of Time). Linux eventfd
-   semantics, small table. Poll readiness is a 1 ms sleep loop (ponytail: condvars if wakeup latency ever matters). ---------- */
+/* ---------- nn::socket event counters: local wakeups work even on the offline host.
+   Horizon's socket errno/flags are BSD values; nnmusl's errno is Linux. EventFdRead/Write return status 0, not
+   the byte count of a POSIX read/write. Poll keeps the existing offline-descriptor behavior (nothing ready).
+   Blocking host waits must hand off the virtual core with no host mutex held. */
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 #define EVFDS 64
-#define EV_BASE 512            /* stay below select()'s 1024-bit set, away from host fds (as nxnative does) */
+#define EV_BASE 512
 #define EV_SEMAPHORE 1u
+#define EV_CLOEXEC 2u
 #define EV_NONBLOCK 4u
-#define EV_MAX 0xfffffffffffffffeull
-static struct { uint64_t count; unsigned flags; int used; } evfd[EVFDS];
+#define EV_MAX UINT64_C(0xfffffffffffffffe)
+static struct { uint64_t count, generation; unsigned flags; int used; } evfd[EVFDS];
 static pthread_mutex_t evfd_lock = PTHREAD_MUTEX_INITIALIZER;
-static int ev_error(int e) { socket_errno = e; return -1; }   /* Linux errnos: the game reads them via nnsocketGetLastErrno */
+static int ev_error(int e) {
+    /* gRPC tests the guest C library's errno as well as nnsocketGetLastErrno. */
+    static _Thread_local int *(*location)(void);
+    socket_errno = e;
+    int libc_error = e == 35 ? 11 : e;
+    if (!location) location = runtime_symbol("__errno_location");
+    if (location) *location() = libc_error;
+    errno = libc_error;
+    return -1;
+}
+/* Caller holds evfd_lock. */
 static int ev_fd(int fd) { return fd >= EV_BASE && fd < EV_BASE + EVFDS && evfd[fd - EV_BASE].used ? fd - EV_BASE : -1; }
+static void ev_sleep_us(long us) {
+    struct timespec ts = {us / 1000000, (us % 1000000) * 1000};
+    int away = runtime_core_away();
+    while (nanosleep(&ts, &ts) && errno == EINTR) { }
+    runtime_core_back(&away);
+}
+static uint64_t ev_deadline(uint64_t duration) {
+    uint64_t now = runtime_now_ns();
+    return duration > UINT64_MAX - now ? UINT64_MAX : now + duration;
+}
+static void ev_pause(uint64_t deadline) {
+    uint64_t now = runtime_now_ns();
+    if (now >= deadline) return;
+    uint64_t left = deadline - now;
+    ev_sleep_us(left >= 1000000 ? 1000 : (long)((left + 999) / 1000));
+}
 static int ev_event_fd(uint64_t init, unsigned flags) {
-    if (init == EV_MAX + 1) return ev_error(22);   /* EINVAL, as eventfd(2) */
+    if (init > EV_MAX || (flags & ~(EV_SEMAPHORE | EV_CLOEXEC | EV_NONBLOCK))) return ev_error(22);
     pthread_mutex_lock(&evfd_lock);
-    for (int i = 0; i < EVFDS; i++) if (!evfd[i].used) { evfd[i].count = init; evfd[i].flags = flags; evfd[i].used = 1; pthread_mutex_unlock(&evfd_lock); return EV_BASE + i; }
-    pthread_mutex_unlock(&evfd_lock);
-    return ev_error(24);   /* EMFILE */
+    for (int i = 0; i < EVFDS; i++) if (!evfd[i].used) {
+        evfd[i].count = init; evfd[i].flags = flags; evfd[i].used = 1; evfd[i].generation++;
+        pthread_mutex_unlock(&evfd_lock); return EV_BASE + i;
+    }
+    pthread_mutex_unlock(&evfd_lock); return ev_error(24);
 }
 static int ev_read(int fd, uint64_t *out) {
-    int i = ev_fd(fd); if (i < 0) return ev_error(9);   /* EBADF */
+    pthread_mutex_lock(&evfd_lock);
+    int i = ev_fd(fd);
+    if (i < 0) { pthread_mutex_unlock(&evfd_lock); return ev_error(9); }
+    uint64_t generation = evfd[i].generation;
     for (;;) {
-        pthread_mutex_lock(&evfd_lock);
-        if (evfd[i].count) { *out = evfd[i].flags & EV_SEMAPHORE ? (evfd[i].count--, 1) : (evfd[i].count = 0, *out); pthread_mutex_unlock(&evfd_lock); return 8; }
+        if (!evfd[i].used || evfd[i].generation != generation) { pthread_mutex_unlock(&evfd_lock); return ev_error(9); }
+        if (evfd[i].count) {
+            uint64_t take = evfd[i].flags & EV_SEMAPHORE ? 1 : evfd[i].count;
+            evfd[i].count -= take; if (out) *out = take;
+            pthread_mutex_unlock(&evfd_lock); return 0;
+        }
+        int nonblock = evfd[i].flags & EV_NONBLOCK;
         pthread_mutex_unlock(&evfd_lock);
-        if (evfd[i].flags & EV_NONBLOCK) return ev_error(11);   /* EAGAIN */
-        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);   /* blocking read: wait for a write */
+        if (nonblock) return ev_error(35);
+        ev_sleep_us(1000);
+        pthread_mutex_lock(&evfd_lock);
     }
 }
 static int ev_write(int fd, uint64_t v) {
-    int i = ev_fd(fd); if (i < 0) return ev_error(9);
-    if (!v) return ev_error(22);
+    pthread_mutex_lock(&evfd_lock);
+    int i = ev_fd(fd);
+    if (i < 0) { pthread_mutex_unlock(&evfd_lock); return ev_error(9); }
+    if (v > EV_MAX) { pthread_mutex_unlock(&evfd_lock); return ev_error(22); }
+    uint64_t generation = evfd[i].generation;
     for (;;) {
-        pthread_mutex_lock(&evfd_lock);
-        if (evfd[i].count <= EV_MAX - v) { evfd[i].count += v; pthread_mutex_unlock(&evfd_lock); return 8; }
+        if (!evfd[i].used || evfd[i].generation != generation) { pthread_mutex_unlock(&evfd_lock); return ev_error(9); }
+        if (evfd[i].count <= EV_MAX - v) { evfd[i].count += v; pthread_mutex_unlock(&evfd_lock); return 0; }
+        int nonblock = evfd[i].flags & EV_NONBLOCK;
         pthread_mutex_unlock(&evfd_lock);
-        if (evfd[i].flags & EV_NONBLOCK) return ev_error(11);
-        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);   /* counter full: wait for a read */
+        if (nonblock) return ev_error(35);
+        ev_sleep_us(1000);
+        pthread_mutex_lock(&evfd_lock);
     }
 }
-static void ev_sleep_us(long us) { struct timespec ts = {us / 1000000, (us % 1000000) * 1000}; nanosleep(&ts, NULL); }
-static int ev_poll(void *fds_, unsigned nfds, int timeout_ms) {   /* struct pollfd {int fd; short events; short revents} */
+static int ev_poll(void *fds_, uint64_t nfds, int timeout_ms) {
     struct { int fd; short events, revents; } *fds = fds_;
-    /* TEMP probe (OoT boot): what the movie TaskQueue and gRPC poll for. */
-    static int ep_count;
-    if (getenv("TOTK_WAIT_LOG") && ep_count < 10) { ep_count++;
-        fprintf(stderr, "[wait-probe] poll nfds=%u timeout=%d fds:", nfds, timeout_ms);
-        for (unsigned k = 0; k < nfds && k < 8; k++) fprintf(stderr, " %d/%x", fds[k].fd, fds[k].events);
-        fprintf(stderr, "\n"); }
-    long waited = 0;
-    for (;;) {
-        int ready = 0;
-        pthread_mutex_lock(&evfd_lock);
-        for (unsigned k = 0; k < nfds; k++) { fds[k].revents = 0; int i = ev_fd(fds[k].fd);
-            if (i >= 0) { if ((fds[k].events & 1) && evfd[i].count) fds[k].revents |= 1; if ((fds[k].events & 4) && evfd[i].count < EV_MAX) fds[k].revents |= 4; if (fds[k].revents) ready++; } }
-        pthread_mutex_unlock(&evfd_lock);
-        if (ready || (timeout_ms >= 0 && waited >= timeout_ms * 1000L)) return ready;
-        ev_sleep_us(1000); waited += 1000;
+    if (nfds && !fds) return ev_error(14);
+    static unsigned ep_count;
+    if (getenv("TOTK_WAIT_LOG") && __atomic_fetch_add(&ep_count, 1, __ATOMIC_RELAXED) < 10) {
+        fprintf(stderr, "[wait-probe] poll nfds=%llu timeout=%d fds:", (unsigned long long)nfds, timeout_ms);
+        for (uint64_t k = 0; k < nfds && k < 8; k++) fprintf(stderr, " %d/%x", fds[k].fd, fds[k].events);
+        fprintf(stderr, "\n");
     }
-}
-static int ev_select(int nfds, void *rin_, void *win_, void *ein_, void *tv_) {   /* FdSet: 32 u32 words; TimeVal {sec,usec} */
-    unsigned *rin = rin_, *win = win_, *ein = ein_;
-    /* TEMP probe (OoT boot): the movie TaskQueue selects on what? */
-    static int es_count;
-    if (getenv("TOTK_WAIT_LOG") && es_count < 10) { es_count++;
-        fprintf(stderr, "[wait-probe] select nfds=%d bits r:", nfds);
-        for (int w = 0; w < 32; w++) if (rin && rin[w]) fprintf(stderr, " w%d=%x", w, rin[w]);
-        fprintf(stderr, " w:");
-        for (int w = 0; w < 32; w++) if (win && win[w]) fprintf(stderr, " w%d=%x", w, win[w]);
-        fprintf(stderr, " tv=%lld.%09ld\n", tv_ ? (long long)((long *)tv_)[0] : -1, tv_ ? (long)((long *)tv_)[1] : 0L); }
-    long budget = -1;   /* microseconds */
-    if (tv_) { long long s = ((long *)tv_)[0], u = ((long *)tv_)[1]; budget = s * 1000000 + u; }
-    long waited = 0;
+    uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : ev_deadline((uint64_t)timeout_ms * 1000000);
     for (;;) {
         int ready = 0;
         pthread_mutex_lock(&evfd_lock);
-        for (int i = 0; i < EVFDS && EV_BASE + i < nfds; i++) {
-            int w = (EV_BASE + i) >> 5, b = 1u << ((EV_BASE + i) & 31);
-            int r = (rin && rin[w] & b) || (ein && ein[w] & b), wr = win && win[w] & b;
-            int hit = (r && evfd[i].count) || (wr && evfd[i].count < EV_MAX);
-            if (rin) rin[w] = (rin[w] & ~b) | (hit && r && evfd[i].count ? b : 0);
-            if (win) win[w] = (win[w] & ~b) | (hit && wr ? b : 0);
-            if (ein) ein[w] &= ~b;
-            if (hit) ready++;
+        for (uint64_t k = 0; k < nfds; k++) {
+            fds[k].revents = 0; int i = ev_fd(fds[k].fd);
+            if (i < 0) continue;   /* no network sockets exist on this offline host */
+            if (evfd[i].count) fds[k].revents |= fds[k].events & (1 | 0x40);   /* POLLIN | POLLRDNORM */
+            if (evfd[i].count < EV_MAX) fds[k].revents |= fds[k].events & 4;   /* POLLOUT / POLLWRNORM */
+            ready += fds[k].revents != 0;
         }
         pthread_mutex_unlock(&evfd_lock);
-        if (ready || (budget >= 0 && waited >= budget)) return ready;
-        ev_sleep_us(1000); waited += 1000;
+        if (ready || runtime_now_ns() >= deadline) return ready;
+        ev_pause(deadline);
+    }
+}
+static int ev_select(int nfds, void *rin_, void *win_, void *ein_, void *tv_) {
+    unsigned *sets[3] = {rin_, win_, ein_}, want[3][32] = {{0}};
+    if (nfds < 0 || nfds > 1024) return ev_error(22);
+    uint64_t deadline = UINT64_MAX;
+    if (tv_) {
+        const int64_t *tv = tv_;
+        if (tv[0] < 0 || tv[0] > INT64_MAX / 1000000000 || tv[1] < 0 || tv[1] >= 1000000) return ev_error(22);
+        deadline = ev_deadline((uint64_t)tv[0] * 1000000000 + (uint64_t)tv[1] * 1000);
+    }
+    for (int k = 0; k < 3; k++) if (sets[k]) memcpy(want[k], sets[k], sizeof want[k]);
+    for (;;) {
+        unsigned result[3][32] = {{0}}; int ready = 0, bad = 0;
+        pthread_mutex_lock(&evfd_lock);
+        for (int fd = 0; fd < nfds; fd++) {
+            unsigned b = 1u << (fd & 31); int w = fd >> 5;
+            if (!((want[0][w] | want[1][w] | want[2][w]) & b)) continue;
+            int i = ev_fd(fd); if (i < 0) { bad = 1; break; }
+            if ((want[0][w] & b) && evfd[i].count) { result[0][w] |= b; ready++; }
+            if ((want[1][w] & b) && evfd[i].count < EV_MAX) { result[1][w] |= b; ready++; }
+            /* No exceptional condition on a local event counter. */
+        }
+        pthread_mutex_unlock(&evfd_lock);
+        if (bad) return ev_error(9);
+        if (ready || runtime_now_ns() >= deadline) {
+            for (int k = 0; k < 3; k++) if (sets[k]) memcpy(sets[k], result[k], sizeof result[k]);
+            return ready;
+        }
+        ev_pause(deadline);
     }
 }
 static int ev_close(int fd) {
-    int i = ev_fd(fd); if (i < 0) return ev_error(9);
-    pthread_mutex_lock(&evfd_lock); evfd[i].used = 0; pthread_mutex_unlock(&evfd_lock);
-    return 0;
+    pthread_mutex_lock(&evfd_lock); int i = ev_fd(fd);
+    if (i >= 0) evfd[i].used = 0;
+    pthread_mutex_unlock(&evfd_lock); return i < 0 ? ev_error(9) : 0;
 }
-static int ev_fcntl(int fd, unsigned cmd, unsigned long arg) {   /* F_GETFL=3 F_SETFL=4; O_NONBLOCK=2048 */
-    int i = ev_fd(fd); if (i < 0) return ev_error(9);
-    if (cmd == 3) return (int)((evfd[i].flags & EV_NONBLOCK) ? 2048 : 0);
-    if (cmd == 4) { pthread_mutex_lock(&evfd_lock); if (arg & 2048) evfd[i].flags |= EV_NONBLOCK; else evfd[i].flags &= ~EV_NONBLOCK; pthread_mutex_unlock(&evfd_lock); return 0; }
-    return 0;
+static int ev_fcntl(int fd, unsigned cmd, unsigned long arg) {
+    pthread_mutex_lock(&evfd_lock); int i = ev_fd(fd), result = 0;
+    if (i >= 0) {
+        if (cmd == 3) result = evfd[i].flags & EV_NONBLOCK ? 4 : 0;   /* BSD O_NONBLOCK */
+        else if (cmd == 4) evfd[i].flags = (evfd[i].flags & ~EV_NONBLOCK) | (arg & 4 ? EV_NONBLOCK : 0);
+        else if (cmd == 1) result = !!(evfd[i].flags & EV_CLOEXEC);
+        else if (cmd == 2) evfd[i].flags = (evfd[i].flags & ~EV_CLOEXEC) | (arg & 1 ? EV_CLOEXEC : 0);
+        else result = -1;
+    }
+    pthread_mutex_unlock(&evfd_lock);
+    return i < 0 ? ev_error(9) : result < 0 ? ev_error(22) : result;
 }
 static int ev_set_error(int e) { socket_errno = e; return 0; }
 
@@ -280,8 +336,8 @@ void *runtime_offline_override(const char *name) {
         {"_ZN2nn4bcat21DeliveryCacheProgressC1Ev", nothing}, {"_ZN2nn4bcat21DeliveryCacheProgressD1Ev", nothing},
         {"_ZN2nn4bcat24RequestSyncDeliveryCacheEPNS0_21DeliveryCacheProgressE", nifm_unavailable},
         {"_ZN2nn6socket10GetSockOptEiiiPvPj", socket_down}, {"_ZN2nn6socket10SetSockOptEiiiPKvj", socket_down},
-        {"_ZN2nn6socket11GetSockNameEiP8sockaddrPj", socket_down}, {"_ZN2nn6socket4PollEP6pollfdmi", socket_down},
-        {"_ZN2nn6socket4RecvEiPvmi", socket_down}, {"_ZN2nn6socket4SendEiPKvmi", socket_down}, {"_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", socket_down},
+        {"_ZN2nn6socket11GetSockNameEiP8sockaddrPj", socket_down}, {"_ZN2nn6socket4PollEP6pollfdmi", ev_poll},
+        {"_ZN2nn6socket4RecvEiPvmi", socket_down}, {"_ZN2nn6socket4SendEiPKvmi", socket_down}, {"_ZN2nn6socket5FcntlEiNS0_12FcntlCommandEz", ev_fcntl},
         {"_ZN2nn6socket6AcceptEiP8sockaddrPj", socket_down}, {"_ZN2nn6socket6ListenEii", socket_down},
         {"_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", socket_down}, {"_ZN2nn6socket6SendToEiPKvmiPK8sockaddrj", socket_down},
         {"_ZN2nn6socket7ConnectEiPK8sockaddrj", socket_down}, {"_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", socket_down},

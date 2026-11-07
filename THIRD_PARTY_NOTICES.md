@@ -36,3 +36,5 @@ Fetched or linked at build time (not in this repository):
 | [ALVR](https://github.com/alvr-org/ALVR) client v20.14.0, downloaded (SHA-256 checked) and installed on the headset by `zeldaVR/install_vr.sh` | shows the VR picture on the Meta Quest 3 | MIT |
 | [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) (Source Han Sans) DemiLight at `165c01b`, downloaded and checked by `windows_games/ra2/scripts/languages.py` | the Simplified Chinese glyphs it draws into the player's game font | SIL OFL 1.1 |
 | [OpenCC](https://github.com/BYVoid/OpenCC), run (not included) by `windows_games/ra2/scripts/languages.py` | Traditional to Simplified Chinese | Apache-2.0 |
+
+| Local event-counter contracts in `games/totk/runtime/offline_host.c`, adapted to virtual-core handoff and this host's symbol lookup | [nxnative PR #1299](https://github.com/seedds/nxnative/pull/1299), revision `ee9b7765d579c46e45a7297493565e098f3bda33`, `dm/host/hle_net.c` | MIT | `games/totk/third_party/licenses/nxnative.txt` |
