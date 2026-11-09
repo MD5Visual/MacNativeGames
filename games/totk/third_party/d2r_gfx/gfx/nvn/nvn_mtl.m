@@ -6704,6 +6704,15 @@ static void *prog_get_p(const prog_t *cp) {   // 只在提交线程调用 | Call
         if(!variant){o->missing|=1<<st;continue;}   // iOS: not translated yet; Mac (async shaders): translating in the background. Its draws are skipped
         prog_stage_set(o,st,variant);
     }
+    if (o->geo && o->key[1]) {   /* diagnostic: name the programs that carry a geometry stage, once per fragment shader */
+        static NSMutableSet *geoTold;
+        if (!geoTold) geoTold = [NSMutableSet set];
+        if (![geoTold containsObject:o->key[1]]) {
+            [geoTold addObject:o->key[1]];
+            MLOG("[geo] program %p: geometry stage present | vertex %s | fragment %s", (void *)p,
+                 o->key[0] ? o->key[0].UTF8String : "-", o->key[1].UTF8String);
+        }
+    }
     if (p->serial) { serial_put(p->serial, o); return (__bridge void *)o; }
     return (void *)CFAutorelease(CFBridgingRetain(o));   // not in the table: alive until the pool drains, as the autoreleased return was
 }
@@ -10764,7 +10773,14 @@ static id<MTLTexture> img_write_view(id<MTLTexture> t, NvShader *sh, uint64_t *r
     *rid = v.gpuResourceID._impl; return v;
 }
 static uint64_t g_pool_frame = ~0ull, g_pool_spent, g_pool_builds, g_pool_left;
-static uint64_t pool_cap_bytes(void) { static uint64_t c; if (!c) { const char *e = getenv("TOTK_POOL_CAP_MB"); c = (e && *e ? strtoull(e, NULL, 10) : 8500) << 20; MLOG("[pool] texture tables: no new textures once Metal has %llu MB allocated", (unsigned long long)(c >> 20)); } return c; }
+/* The texture tables stop making new textures past this, and an ID whose turn never comes reads as a dummy: in OoT a
+   lightmap/probe made late leaves an area lit wrongly, and only a later load with a different allocation order fixes it.
+   8,500 MB was tuned for a 16 GB Mac (guard 12.3 GB); on a larger Mac the same number refuses textures while the guard
+   still has 20 GB of room, so the default now follows the guard instead: guard - 4 GB, never below 8,500 MB. */
+static uint64_t pool_cap_bytes(void) { static uint64_t c; if (!c) { const char *e = getenv("TOTK_POOL_CAP_MB");
+    if (e && *e) c = strtoull(e, NULL, 10) << 20;
+    else { uint64_t lim = wired_limit_bytes(), d = lim > (4096ull << 20) ? lim - (4096ull << 20) : 0;
+           c = d > (8500ull << 20) ? d : (8500ull << 20); } MLOG("[pool] texture tables: no new textures once Metal has %llu MB allocated", (unsigned long long)(c >> 20)); } return c; }
 static int pool_target_type(const treg_t *r) {   // the Metal type a registered texture will have, from its descriptor (a view may choose another: then it is looked at when made)
     switch (r->t.d.target) { case 0: return MTLTextureType1D; case 1: case 7: return MTLTextureType2D; case 2: return MTLTextureType3D; case 3: return MTLTextureType1DArray; case 4: return MTLTextureType2DArray;
         case 5: return MTLTextureType2DMultisample; case 6: return MTLTextureType2DMultisampleArray; case 8: return MTLTextureTypeCube; case 9: return MTLTextureTypeCubeArray; default: return -1; }
@@ -15046,6 +15062,23 @@ static uint64_t g_mesh_ind_args, g_mesh_ind_first;   // indirect form: GPU addre
 extern int totk_depth_near_minus_w(void);
 typedef struct { pso_key raster; const void *task; uint32_t zero_depth, pad; } mesh_pso_key;
 static nvn_hmap g_mesh_psos = {.klen = sizeof(mesh_pso_key)};
+/* A mesh pipeline Metal refuses (its fragment reads a varying the mesh shader never writes) was rebuilt on every draw:
+   39,238 attempts in one session, which ended in a host trap after a storm of them. Remember the failure per key and
+   skip the draw quietly until the translator can pad the mesh outputs (the real fix). */
+static nvn_hmap g_mesh_pso_fail = {.klen = sizeof(mesh_pso_key)};
+/* A depth-only pass has no colour attachment: its fragment stage cannot affect the result, but Metal still validates the
+   fragment's inputs against the mesh outputs. OoT's shadow/prepass meshes are position-only, so the colour-pass fragment
+   (which reads user(locn5)) must not take part, or the whole mesh pipeline is rejected every frame. */
+static id<MTLFunction> mesh_depth_fn(void) {
+    static id<MTLFunction> fn;
+    if (!fn) {
+        NSError *e = nil;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment void dm_mesh_depth_only() {}\n" options:nil error:&e];
+        if (lib) fn = [lib newFunctionWithName:@"dm_mesh_depth_only"];
+        if (!fn) MLOG("[mesh] [RED] depth-only fragment: %s", e.localizedDescription.UTF8String);
+    }
+    return fn;
+}
 static id<MTLRenderPipelineState> mesh_pso(NvProg *pr) {
     NvShader *ts = pr->sh[3], *ms = pr->sh[4], *fs = pr->sh[1];
     if (!ms || ms->mesh_kind != 2 || !ms->fn) { RED_ONCE(90, "mesh draw without a translated mesh shader"); return nil; }
@@ -15056,17 +15089,19 @@ static id<MTLRenderPipelineState> mesh_pso(NvProg *pr) {
     key.task = (__bridge void *)ts; key.zero_depth = !totk_depth_near_minus_w();
     id<MTLRenderPipelineState> ps = hm_get_id(&g_mesh_psos, &key);
     if (ps) return ps;
+    if (nvn_hm_get(&g_mesh_pso_fail, &key)) return nil;   /* known bad: one attempt, not one per draw */
     MTLRenderPipelineDescriptor *r = pso_desc(&key.raster, ms, fs, nil, 0);
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-    m.meshFunction = key.zero_depth && ms->mesh_zero ? ms->mesh_zero : ms->fn;
-    m.fragmentFunction = r.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    m.meshFunction = key.zero_depth && ms->mesh_zero ? ms->mesh_zero : ms->fn;   /* pad belongs in the translator (MeshStage + paired fragment), not a runtime variant on the replay thread */
+    int color = 0; for (int i = 0; i < 8; i++) if (key.raster.cfmt[i]) color = 1;
+    m.fragmentFunction = color ? r.fragmentFunction : mesh_depth_fn(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; m.maxTotalThreadgroupsPerMeshGrid = 1024; }
     m.rasterSampleCount = r.rasterSampleCount; m.alphaToCoverageEnabled = r.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = r.colorAttachments[i];
     m.depthAttachmentPixelFormat = r.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = r.stencilAttachmentPixelFormat;
     NSError *error = nil;
     ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&error];
-    if (!ps) { MLOG("[mesh] [RED] pipeline task %s mesh %s fragment %s: %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", error.localizedDescription.UTF8String); return nil; }
+    if (!ps) { nvn_hm_put(&g_mesh_pso_fail, &key, (void *)(uintptr_t)1); MLOG("[mesh] [RED] pipeline task %s mesh %s fragment %s: %s (kept skipped)", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", error.localizedDescription.UTF8String); return nil; }
     hm_put_id(&g_mesh_psos, &key, ps);
     { static unsigned n; if (n++ < 16) MLOG("[mesh] pipeline ready: task %s mesh %s fragment %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-"); }
     return ps;
